@@ -330,3 +330,69 @@ python3 repair_authors.py --dry-run --limit 200 --rps 2     # podgląd
 python3 repair_authors.py --workers 8 --rps 2 --save-cache --fix-publisher
 # przerwane? ta sama komenda wznawia.
 ```
+
+
+
+---
+
+## 12. Praca rozproszona (PC + serwer) i scalanie baz
+
+Możesz naprawiać bazę na dwóch maszynach naraz. Każda ma **inne IP**, więc
+serwis widzi dwóch niezależnych klientów → realnie ~2× szybciej, bez
+podbijania tempa na pojedynczym IP.
+
+### Idea
+- Dzielisz książki **rozłącznie** flagą `--shard i/n` (każda maszyna bierze
+  `id % n == i`).
+- Obie maszyny zapisują pobrany HTML (`--save-cache`).
+- Na końcu **łączysz cache** (a nie pliki SQLite — to bezpieczniejsze) i na
+  jednej bazie‑master uruchamiasz `--cache-only --recheck`, co nanosi poprawki
+  dla wszystkich książek lokalnie, bez sieci.
+
+### Krok 0 — punkt startowy
+Obie maszyny startują z **tej samej** kopii bazy (skażonej) — np. skopiuj
+`data/database.db` na PC i na serwer. Zrób kopię zapasową na każdej.
+
+### Krok 1 — równoległa naprawa (każda maszyna swoja połowa)
+```bash
+# PC  (połowa parzysta)
+python3 repair_authors.py --shard 0/2 --workers 8 --rps 2 --save-cache --fix-publisher
+
+# Serwer (połowa nieparzysta)
+python3 repair_authors.py --shard 1/2 --workers 8 --rps 2 --save-cache --fix-publisher
+```
+Można dzielić na więcej maszyn: `--shard 0/3`, `--shard 1/3`, `--shard 2/3` itd.
+Każdy shard jest **wznawialny** niezależnie (własna tabela postępu w swojej bazie).
+
+### Krok 2 — zbierz cache HTML w jedno miejsce
+Pliki cache nazywają się `data/html_cache/{typ}_{external_id}.html`, więc są
+**rozłączne** między shardami — wystarczy je zsumować na maszynie‑master:
+```bash
+# na master (np. serwer): dociągnij cache z PC
+rsync -av user@PC:/sciezka/lubimyczytac/data/html_cache/  data/html_cache/
+#   (Windows → serwer: użyj WinSCP i wgraj zawartość data\html_cache\ do data/html_cache/)
+```
+
+### Krok 3 — nanieś poprawki dla CAŁEJ bazy z cache (bez sieci, szybko)
+```bash
+# master ma wszystkie rekordy ksiazek + polaczony cache
+cp data/database.db data/database.backup_premerge.db
+python3 repair_authors.py --cache-only --recheck --workers 8 --fix-publisher
+```
+`--cache-only` => zero sieci (tylko lokalne parsowanie), `--recheck` => przejdź
+wszystkie książki. Master ma teraz komplet poprawek. Druga baza jest zbędna.
+
+### Uwagi
+- **Tempo:** każda maszyna ma własny `--rps` (np. 2–3). Obserwuj `logs/repair.log`
+  na obu — przy 429 zejdź z rps na danej maszynie.
+- **Dlaczego cache, a nie scalanie SQLite:** ID autorów (`authors.id`) bywają
+  różne między bazami, więc łączenie tabel po kluczach jest ryzykowne. Cache +
+  `--cache-only --recheck` nanosi poprawki **po nazwach autorów i `external_id`**,
+  więc jest odporne i deterministyczne.
+- **Alternatywa bez cache:** jeśli nie chcesz przerzucać cache, możesz na master
+  puścić zwykły przebieg sieciowy `--recheck` — ale wtedy master pobiera
+  wszystko sam (bez przyspieszenia). Cache to właśnie to, co daje przyspieszenie
+  z dwóch maszyn.
+- Scrapowanie nowych książek (pająk/skaner) też można shardować ręcznie
+  (np. różne zakresy ID przez menu „Skaner ID"), ale do uzupełniania katalogu
+  prościej puścić pająka na jednej maszynie — kolejka i tak dedupuje.

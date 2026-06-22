@@ -168,30 +168,40 @@ def compute_correct_data(snapshot: dict, cache_only: bool, save_cache: bool, scr
     return result
 
 
-def count_remaining(recheck: bool) -> int:
+def count_remaining(recheck: bool, shard) -> int:
     """Szybki licznik do paska postepu/ETA (bez ladowania rekordow)."""
+    si, sn = shard
+    shard_sql = f" AND (id % {sn}) = {si}" if sn > 1 else ""
+    shard_sql_p = f" AND (book_id % {sn}) = {si}" if sn > 1 else ""
     with get_session() as session:
-        total = session.execute(select(func.count(Book.id))).scalar() or 0
+        total = session.execute(
+            text(f"SELECT COUNT(*) FROM books WHERE 1=1{shard_sql}")
+        ).scalar() or 0
         if recheck:
             return total
         done = session.execute(
-            text("SELECT COUNT(*) FROM author_repair_progress WHERE status IN ('fixed','ok')")
+            text("SELECT COUNT(*) FROM author_repair_progress "
+                 f"WHERE status IN ('fixed','ok'){shard_sql_p}")
         ).scalar() or 0
         return max(0, total - done)
 
 
-def iter_windows(recheck: bool, limit, window: int):
+def iter_windows(recheck: bool, limit, window: int, shard):
     """Generator OKIEN ksiazek (lista lekkich dict). Stala pamiec.
 
     Pomijanie juz przetworzonych realizowane w SQL (NOT IN), wiec nie trzymamy
     zbioru ID w RAM. Autorzy i wydawca doczytywani sa hurtem dla calego okna.
+    shard=(i, n): bierz tylko ksiazki, dla ktorych (id % n) == i (rozlaczne
+    podzialy do pracy na wielu maszynach).
     """
+    si, sn = shard
     last_id = 0
     yielded = 0
     skip_clause = "" if recheck else (
         " AND books.id NOT IN (SELECT book_id FROM author_repair_progress "
         "WHERE status IN ('fixed','ok'))"
     )
+    shard_clause = f" AND (books.id % {sn}) = {si}" if sn > 1 else ""
     while True:
         if limit and yielded >= limit:
             return
@@ -199,7 +209,7 @@ def iter_windows(recheck: bool, limit, window: int):
             rows = session.execute(
                 text(
                     "SELECT id, external_id, url, type FROM books "
-                    "WHERE id > :last_id" + skip_clause +
+                    "WHERE id > :last_id" + skip_clause + shard_clause +
                     " ORDER BY id ASC LIMIT :win"
                 ),
                 {"last_id": last_id, "win": window},
@@ -270,7 +280,7 @@ def apply_publisher_fix(session, book_id: int, pub_name: str):
     book.publisher = pub
 
 
-def repair(dry_run, cache_only, limit, workers, recheck, save_cache, fix_publisher, rps, window):
+def repair(dry_run, cache_only, limit, workers, recheck, save_cache, fix_publisher, rps, window, shard):
     if rps:
         config.REQUESTS_PER_SECOND = rps
     init_db()
@@ -287,11 +297,12 @@ def repair(dry_run, cache_only, limit, workers, recheck, save_cache, fix_publish
     with get_session() as session:
         ensure_progress_table(session)
 
-    total_est = count_remaining(recheck)
+    total_est = count_remaining(recheck, shard)
     if limit:
         total_est = min(total_est, limit)
+    shard_info = f" | shard={shard[0]}/{shard[1]}" if shard[1] > 1 else ""
     logger.info(f"Do sprawdzenia (szac.): {total_est} ksiazek | okno={window} | "
-                f"watki={workers} | tempo~{config.REQUESTS_PER_SECOND}/s | wydawca={fix_publisher}")
+                f"watki={workers} | tempo~{config.REQUESTS_PER_SECOND}/s | wydawca={fix_publisher}{shard_info}")
     if total_est == 0:
         console.print("[green]Brak ksiazek do przetworzenia.[/green]")
         return
@@ -321,7 +332,7 @@ def repair(dry_run, cache_only, limit, workers, recheck, save_cache, fix_publish
     with progress_cm as progress:
         task = progress.add_task("start", total=total_est, fixed=0, ok=0, skip=0) if use_bar else None
         try:
-            for batch in iter_windows(recheck, limit, window):
+            for batch in iter_windows(recheck, limit, window, shard):
                 if STOP.is_set():
                     break
                 # --- Etap 1: pobranie + parsowanie rownolegle (bez bazy) ---
@@ -460,8 +471,19 @@ def main():
     parser.add_argument("--recheck", action="store_true", help="Ignoruj postep - zweryfikuj ponownie wszystkie.")
     parser.add_argument("--save-cache", action="store_true", help="Zapisuj pobrany HTML do cache.")
     parser.add_argument("--fix-publisher", action="store_true", help="Popraw takze wydawce.")
+    parser.add_argument("--shard", default="0/1",
+                        help="Podzial pracy na maszyny w formacie i/n, np. 0/2 i 1/2 "
+                             "(kazda maszyna bierze rozlaczne ksiazki: id %% n == i).")
     parser.add_argument("--log-file", default="logs/repair.log", help="Plik logu (rotowany).")
     args = parser.parse_args()
+
+    # Parsowanie --shard "i/n"
+    try:
+        si, sn = (int(x) for x in args.shard.split("/"))
+        assert sn >= 1 and 0 <= si < sn
+    except (ValueError, AssertionError):
+        print("Bledny --shard. Uzyj formatu i/n, np. 0/2 lub 1/2 (0 <= i < n).")
+        sys.exit(2)
 
     os.makedirs(os.path.dirname(args.log_file) or ".", exist_ok=True)
     logger.remove()
@@ -479,6 +501,7 @@ def main():
         fix_publisher=args.fix_publisher,
         rps=args.rps if args.rps > 0 else None,
         window=max(50, args.window),
+        shard=(si, sn),
     )
 
 
