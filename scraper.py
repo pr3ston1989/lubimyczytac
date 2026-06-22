@@ -103,7 +103,7 @@ class Scraper:
         response.raise_for_status()
         return response.text
 
-    def process_book_page(self, url: str, html: str, db_session):
+    def process_book_page(self, url: str, html: str, db_session, download_covers: bool = True):
         data = extract_book_info(html, url)
         if not data or not data.get('title'):
             raise ValueError("Nie udalo sie sparsowac detali")
@@ -127,7 +127,7 @@ class Scraper:
             db_session.add(book)
             db_session.flush()
 
-        if data.get('cover_url'):
+        if download_covers and data.get('cover_url'):
             if not db_session.query(Cover).filter_by(book_id=book.id).first():
                 cover_meta = download_cover(data['cover_url'], data['type'], str(data['external_id']))
                 if cover_meta:

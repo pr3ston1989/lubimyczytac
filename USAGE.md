@@ -396,3 +396,65 @@ wszystkie książki. Master ma teraz komplet poprawek. Druga baza jest zbędna.
 - Scrapowanie nowych książek (pająk/skaner) też można shardować ręcznie
   (np. różne zakresy ID przez menu „Skaner ID"), ale do uzupełniania katalogu
   prościej puścić pająka na jednej maszynie — kolejka i tak dedupuje.
+
+
+
+---
+
+## 13. Serwer = naprawa, PC = pająk, równolegle + scalanie
+
+Tak, możesz naprawiać autorów na serwerze i jednocześnie dodawać nowe książki
+pająkiem na PC, a potem zlać wszystko w jedną bazę. **Nie scalamy plików SQLite**
+(ryzyko kolizji `authors.id`/`books.id`) — scalamy przez **wspólny cache HTML**,
+który scraper i tak zapisuje automatycznie (`data/html_cache/{typ}_{id}.html`).
+
+### Jak to działa
+- Naprawa i pająk to operacje na **rozłącznych** zbiorach (istniejące vs nowe
+  książki), a obie zapisują HTML do cache.
+- `ingest_cache.py` wczytuje cache do jednej bazy‑master **bez sieci**: nowe
+  książki dodaje, istniejące poprawia (naprawionym parserem).
+
+### Krok 1 — równolegle
+```bash
+# SERWER: naprawa istniejących (z zapisem cache)
+python3 repair_authors.py --workers 3 --rps 1.5 --save-cache --fix-publisher
+
+# PC: pająk dokłada nowe książki (process_book_page auto-zapisuje cache)
+python3 main.py spider        # (ustaw wcześniej REQUESTS_PER_SECOND, np. set/$env)
+```
+
+### Krok 2 — zbierz cache na maszynie‑master (np. serwer)
+```bash
+# z PC -> serwer (pliki są rozłączne, więc bez konfliktów):
+rsync -av user@PC:/.../lubimyczytac/data/html_cache/  data/html_cache/
+#   Windows -> serwer: WinSCP, wgraj zawartość data\html_cache\ do data/html_cache/
+```
+
+### Krok 3 — wczytaj cały cache do bazy‑master (offline, szybko)
+```bash
+cp data/database.db data/database.backup_premerge.db
+python3 ingest_cache.py
+```
+- Nowe książki (z cache pająka) zostaną **dodane** z poprawnymi autorami.
+- Istniejące zostaną **poprawione** (autorzy/kategorie/recenzje).
+- Okładki pomijane (tryb offline). Bez sieci.
+- Wznawialny (`cache_ingest_progress`), przerywalny (Ctrl+C), `--limit`,
+  `--recheck`, `--cache-dir`.
+
+### ingest_cache.py — parametry
+| Flaga | Domyślnie | Opis |
+|---|---|---|
+| `--cache-dir` | `data/html_cache` | Katalog z plikami cache |
+| `--limit N` | 0 (wszystkie) | Maks. plików w tym uruchomieniu |
+| `--batch N` | 500 | Co ile rekordów commit |
+| `--recheck` | — | Przetwórz też już wczytane pliki |
+| `--log-file` | `logs/ingest.log` | Plik logu |
+
+### Uwagi
+- Master DB musi mieć rekordy istniejących książek (czyli to ta sama baza
+  bazowa). `ingest_cache.py` dołoży nowe i poprawi stare.
+- Jeśli wolisz prościej, bez równoległości: najpierw pająk (uzupełnij katalog —
+  nowe książki od razu z dobrymi autorami), potem `repair_authors.py` na całości.
+- Pająka też można rozdzielić ręcznie (różne zakresy „Skaner ID"), ale do
+  uzupełniania katalogu wystarczy jedna maszyna — kolejka dedupuje po `url`,
+  a `process_book_page` po `external_id`.
