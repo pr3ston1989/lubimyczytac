@@ -1,4 +1,5 @@
 import re
+import json
 from bs4 import BeautifulSoup
 from loguru import logger
 from typing import Optional, List, Dict, Any
@@ -34,6 +35,113 @@ def standardize_date(text: Optional[str]) -> Optional[str]:
     if match:
         return f"{match.group(3)}-{match.group(2)}-{match.group(1)}"
     return text.strip()
+
+
+# Kontenery, w ktorych znajduja sie WYLACZNIE autorzy danej ksiazki (naglowek strony).
+# Uzywane jako fallback, gdy brak atrybutu data-ga-book-authors.
+# Kolejnosc = priorytet. UWAGA: aktualizowac przy zmianie HTML portalu.
+AUTHOR_CONTAINER_SELECTORS = [
+    "div.book__author",
+    ".book__author",
+    "span.author",
+    ".title-container .author",
+    ".book__headerInfo .author",
+]
+
+
+def _split_ga_list(value: Optional[str]) -> List[str]:
+    """Rozbija liste z atrybutu data-ga-* (np. autorzy/wydawcy) po przecinku."""
+    if not value:
+        return []
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _extract_jsonld_authors(soup) -> List[str]:
+    """Autorzy z JSON-LD (script type=application/ld+json, @type=Book).
+
+    To najbardziej odporne zrodlo - dane strukturalne ustawiane przez serwis,
+    niezalezne od ukladu HTML. author moze byc dict, lista lub string.
+    """
+    names: List[str] = []
+    for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        raw = tag.string or tag.get_text() or ""
+        if '"Book"' not in raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        candidates = data if isinstance(data, list) else [data]
+        for obj in candidates:
+            if not isinstance(obj, dict) or obj.get("@type") != "Book":
+                continue
+            author = obj.get("author")
+            items = author if isinstance(author, list) else [author]
+            for a in items:
+                if isinstance(a, dict) and a.get("name"):
+                    names.append(a["name"].strip())
+                elif isinstance(a, str) and a.strip():
+                    names.append(a.strip())
+            if names:
+                return names
+    return names
+
+
+def extract_authors(soup) -> List[Dict[str, Any]]:
+    """Wyciaga TYLKO autorow danej ksiazki.
+
+    Krytyczne: nie wolno uzywac globalnego ``soup.select("a[href*='/autor/']")``,
+    bo strona zawiera dziesiatki linkow do autorow INNYCH ksiazek (widgety
+    "Inne wydania"/"Podobne", rekomendacje, recenzje, stopka). Pobranie ich
+    wszystkich powoduje przypisanie losowych, obcych autorow.
+
+    Strategia (od najbardziej do najmniej wiarygodnej):
+      1) JSON-LD (@type=Book) - dane strukturalne, najodporniejsze;
+      2) atrybut ``data-ga-book-authors`` na kontenerze ksiazki;
+      3) link autora w naglowku (``span.author`` / ``.book__author``);
+      4) ostatecznie ``a.link-name`` (nigdy cala strona).
+    """
+    authors: List[Dict[str, Any]] = []
+    seen = set()
+
+    def _add(name):
+        if name and name not in seen:
+            seen.add(name)
+            authors.append({"name": name})
+
+    # 1) JSON-LD - najpewniejsze, niezalezne od ukladu HTML.
+    for name in _extract_jsonld_authors(soup):
+        _add(name)
+    if authors:
+        return authors
+
+    # 2) atrybut data-ga-book-authors.
+    ga = soup.select_one("[data-ga-book-authors]")
+    if ga is not None:
+        for name in _split_ga_list(ga.get("data-ga-book-authors")):
+            _add(name)
+        if authors:
+            return authors
+
+    # 3) Fallback - zakres ograniczony do naglowka ksiazki.
+    scope = None
+    for selector in AUTHOR_CONTAINER_SELECTORS:
+        scope = soup.select_one(selector)
+        if scope is not None:
+            break
+
+    if scope is not None:
+        candidate_links = scope.select("a[href*='/autor/']")
+    else:
+        # 4) Ostatecznosc - tylko jawnie oznaczone linki, nigdy cala strona.
+        candidate_links = soup.select(
+            "span.author a[href*='/autor/'], a.link-name[href*='/autor/']"
+        )
+
+    for a in candidate_links:
+        _add(a.get_text(strip=True))
+
+    return authors
 
 def extract_book_info(html: str, url: str) -> Optional[Dict[str, Any]]:
     soup = BeautifulSoup(html, 'lxml')
@@ -87,11 +195,8 @@ def extract_book_info(html: str, url: str) -> Optional[Dict[str, Any]]:
     if rating:
         data['avg_rating'] = clean_float(rating.get_text())
 
-    # Autorzy
-    for a in soup.select("a[href*='/autor/']"):
-        name = a.get_text(strip=True)
-        if name and {"name": name} not in data['authors']:
-            data['authors'].append({"name": name})
+    # Autorzy - WYLACZNIE z naglowka ksiazki (patrz extract_authors).
+    data['authors'] = extract_authors(soup)
 
     # Szczegoly ksiazki (tabela dt/dd)
     details_div = soup.select_one("#book-details")
@@ -135,10 +240,16 @@ def extract_book_info(html: str, url: str) -> Optional[Dict[str, Any]]:
                     else:
                         data['series'] = {"name": raw_series}
 
-    # Wydawnictwo
-    pub = soup.select_one("a[href*='/wydawnictwo/']")
-    if pub:
-        data['publisher'] = {"name": pub.get_text(strip=True)}
+    # Wydawnictwo - najpierw atrybut data-ga-book-publishers (wiarygodny),
+    # potem fallback do pierwszego linku /wydawnictwo/.
+    ga_pub = soup.select_one("[data-ga-book-publishers]")
+    pub_names = _split_ga_list(ga_pub.get("data-ga-book-publishers")) if ga_pub else []
+    if pub_names:
+        data['publisher'] = {"name": pub_names[0]}
+    else:
+        pub = soup.select_one("a[href*='/wydawnictwo/']")
+        if pub:
+            data['publisher'] = {"name": pub.get_text(strip=True)}
 
     # Kategorie
     for cat in soup.select("a.book__category"):
