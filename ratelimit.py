@@ -20,6 +20,8 @@ import threading
 import time
 import random
 
+from runtime import interruptible_sleep
+
 
 class RateLimiter:
     def __init__(self, requests_per_second: float = 1.0, jitter: float = 0.1,
@@ -47,7 +49,7 @@ class RateLimiter:
             self._next_time = scheduled + interval
         delay = scheduled - time.monotonic()
         if delay > 0:
-            time.sleep(delay)
+            interruptible_sleep(delay)
 
     def penalize(self):
         """Po 429/503 MNOZY odstep (gwaltowne zwolnienie, do max_interval)."""

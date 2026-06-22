@@ -13,6 +13,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 
 import config
 from ratelimit import RateLimiter
+from runtime import STOP, interruptible_sleep, request_stop, Interrupted
 from database import get_session
 from sqlalchemy import func
 from models import Book, Author, Publisher, Series, Category, Cover, Review, ScrapeQueue
@@ -54,14 +55,18 @@ class Scraper:
         """
         last_exc = None
         for attempt in range(config.MAX_HTTP_RETRIES + 1):
+            if STOP.is_set():
+                raise Interrupted()
             self.rate_limiter.wait()
+            if STOP.is_set():
+                raise Interrupted()
             try:
                 resp = self.get_http_session().get(
                     url, headers=config.get_random_headers(), timeout=15
                 )
             except Exception as e:  # noqa: BLE001 - sieciowe bledy przejsciowe
                 last_exc = e
-                time.sleep(min(2 ** attempt, 30) + random.uniform(0, 1))
+                interruptible_sleep(min(2 ** attempt, 30) + random.uniform(0, 1))
                 continue
 
             if resp.status_code in (429, 503):
@@ -79,7 +84,7 @@ class Scraper:
                     f"HTTP {resp.status_code} dla {url} - czekam {wait_s:.1f}s "
                     f"(proba {attempt + 1}/{config.MAX_HTTP_RETRIES})"
                 )
-                time.sleep(wait_s)
+                interruptible_sleep(wait_s)
                 continue
 
             # Sukces (lub trwaly status jak 404) - powoli wracamy do tempa bazowego.
@@ -244,6 +249,9 @@ class Scraper:
                     self.enqueue_spider_links(discovered_links, db_session)
             mark_status(item_id, "completed")
             return f"Zapisano: {url.split('/')[-1][:30]}"
+        except Interrupted:
+            # Przerwano (Ctrl+C) - zostaw status 'processing' (run_queue wznowi).
+            return "Przerwano"
         except Exception as e:
             logger.error(f"Blad dla {url}: {e}")
             # Bledy przejsciowe -> retry/dead-letter (mark_queue_failed),
@@ -271,24 +279,32 @@ class Scraper:
         ) as progress:
             task = progress.add_task("Rozgrzewanie pajakow...", total=total_tasks)
             processed_count = 0
-            # JEDEN executor na cale uruchomienie - bez tworzenia/niszczenia puli
-            # przy kazdej paczce. Pobieramy wieksze paczki (4x liczba watkow),
-            # by pula byla stale zasilona.
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                while True:
+            # JEDEN executor na cale uruchomienie. NIE uzywamy 'with', bo jego
+            # wyjscie czeka na wszystkie zakolejkowane zadania (przy Ctrl+C =
+            # wiszenie). Sterujemy zamknieciem recznie.
+            executor = ThreadPoolExecutor(max_workers=self.max_workers)
+            try:
+                while not STOP.is_set():
                     batch = get_batch_queue(limit=self.max_workers * 4)
                     if not batch:
                         break
                     futures = {executor.submit(self.process_single_item, item): item for item in batch}
-                    for future in as_completed(futures):
-                        status_msg = future.result()
-                        processed_count += 1
-                        progress.update(task, description=status_msg, completed=processed_count)
-                    # COUNT tylko RAZ na paczke (nie na kazdy element) - tryb spider
-                    # dorzuca nowe linki, wiec aktualizujemy laczna sume okresowo.
+                    try:
+                        for future in as_completed(futures):
+                            status_msg = future.result()
+                            processed_count += 1
+                            progress.update(task, description=status_msg, completed=processed_count)
+                    except KeyboardInterrupt:
+                        request_stop()
+                        progress.console.print("\n[bold red]Zatrzymywanie (Ctrl+C)... porzucam kolejke paczki.[/bold red]")
+                        for f in futures:
+                            f.cancel()
+                        break
                     with get_session() as session:
                         new_pending = session.query(ScrapeQueue).filter_by(status='pending').count()
                     progress.update(task, total=processed_count + new_pending)
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
 
     def seed_start_urls(self):
         starts = ["https://lubimyczytac.pl/katalog", "https://lubimyczytac.pl/ksiazki/nowosci"]
@@ -380,6 +396,10 @@ class Scraper:
                                 raise e
                     else:
                         status_msg = f"Pominieto (inny link): ID {current_id}"
+        except Interrupted:
+            # Przerwano (Ctrl+C) - nie zapisujemy 404 ani bledu, ID zostanie
+            # ponownie sprawdzone przy nastepnym uruchomieniu.
+            status_msg = f"Przerwano: ID {current_id}"
         except Exception as e:
             logger.error(f"Blad przy lataniu ID {current_id}: {str(e)[:100]}")
             status_msg = f"Blad sieci: ID {current_id}"
@@ -417,30 +437,34 @@ class Scraper:
             TextColumn("[cyan]Pozostalo: {task.remaining}"),
         ) as progress:
             task = progress.add_task("Uruchamianie...", total=len(missing_ids))
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                batch_size = 5000
-                done = saved = miss = err = 0
-                try:
-                    for i in range(0, len(missing_ids), batch_size):
-                        batch = missing_ids[i : i + batch_size]
-                        futures = {executor.submit(self._process_gap_id, cid, progress, task): cid for cid in batch}
+            executor = ThreadPoolExecutor(max_workers=self.max_workers)
+            batch_size = 5000
+            done = saved = miss = err = 0
+            try:
+                for i in range(0, len(missing_ids), batch_size):
+                    if STOP.is_set():
+                        break
+                    batch = missing_ids[i : i + batch_size]
+                    futures = {executor.submit(self._process_gap_id, cid, progress, task): cid for cid in batch}
+                    try:
                         for future in as_completed(futures):
                             msg = future.result()
                             done += 1
                             if msg.startswith("Zapisano"): saved += 1
                             elif msg.startswith("Pudlo"): miss += 1
                             elif msg.startswith("Blad"): err += 1
-                            # Log cykliczny (plik + stdout) - widoczny przez SSH/nohup.
                             if done % 200 == 0:
                                 logger.info(f"Latanie dziur: {done}/{len(missing_ids)} | "
                                             f"zapisane={saved} 404={miss} bledy={err} | "
                                             f"tempo={self.rate_limiter.current_rps:.2f} zad/s")
-                except KeyboardInterrupt:
-                    progress.console.print("\n[bold red]Zatrzymywanie pajakow (to moze zajac kilka sekund)...[/bold red]")
-                    for future in futures:
-                        future.cancel()
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    raise
+                    except KeyboardInterrupt:
+                        request_stop()
+                        progress.console.print("\n[bold red]Zatrzymywanie (Ctrl+C)... porzucam reszte ID.[/bold red]")
+                        for f in futures:
+                            f.cancel()
+                        break
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
 
     def run_custom_id_scanner(self, start_id: int, direction: str = "up", count: int = 20000):
         logger.info(f"[!] Uruchamiam wielowatkowy skaner ID. Start: {start_id}, Kierunek: {direction}, Ilosc: {count}")
@@ -481,13 +505,16 @@ class Scraper:
             TextColumn("[cyan]Pozostalo: {task.remaining}"),
         ) as progress:
             task = progress.add_task("Skanowanie...", total=len(missing_ids))
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                batch_size = 5000
-                done = saved = miss = err = 0
-                try:
-                    for i in range(0, len(missing_ids), batch_size):
-                        batch = missing_ids[i : i + batch_size]
-                        futures = {executor.submit(self._process_gap_id, cid, progress, task): cid for cid in batch}
+            executor = ThreadPoolExecutor(max_workers=self.max_workers)
+            batch_size = 5000
+            done = saved = miss = err = 0
+            try:
+                for i in range(0, len(missing_ids), batch_size):
+                    if STOP.is_set():
+                        break
+                    batch = missing_ids[i : i + batch_size]
+                    futures = {executor.submit(self._process_gap_id, cid, progress, task): cid for cid in batch}
+                    try:
                         for future in as_completed(futures):
                             msg = future.result()
                             done += 1
@@ -498,9 +525,11 @@ class Scraper:
                                 logger.info(f"Skaner ID: {done}/{len(missing_ids)} | "
                                             f"zapisane={saved} 404={miss} bledy={err} | "
                                             f"tempo={self.rate_limiter.current_rps:.2f} zad/s")
-                except KeyboardInterrupt:
-                    progress.console.print("\n[bold red]Zatrzymywanie skanera ID...[/bold red]")
-                    for future in futures:
-                        future.cancel()
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    raise
+                    except KeyboardInterrupt:
+                        request_stop()
+                        progress.console.print("\n[bold red]Zatrzymywanie skanera ID (Ctrl+C)...[/bold red]")
+                        for f in futures:
+                            f.cancel()
+                        break
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)

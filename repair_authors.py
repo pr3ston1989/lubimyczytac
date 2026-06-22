@@ -43,6 +43,7 @@ from rich.progress import (Progress, SpinnerColumn, TextColumn, BarColumn,
 from sqlalchemy import select, text, func
 
 import config
+from runtime import STOP, request_stop, Interrupted
 from database import get_session, init_db
 from models import Book, Author, Publisher, book_authors
 from parser import extract_book_info
@@ -311,25 +312,38 @@ def repair(dry_run, cache_only, limit, workers, recheck, save_cache, fix_publish
     def _rate():
         return f" | tempo {scraper.rate_limiter.current_rps:.2f}/s" if scraper else ""
 
+    # Jeden executor na cale uruchomienie. Bez 'with' - sterujemy zamknieciem
+    # recznie, by Ctrl+C nie czekal na wszystkie zakolejkowane zadania.
+    executor = ThreadPoolExecutor(max_workers=workers) if not (cache_only or workers <= 1) else None
+
     with progress_cm as progress:
         task = progress.add_task("start", total=total_est, fixed=0, ok=0, skip=0) if use_bar else None
         try:
             for batch in iter_windows(recheck, limit, window):
+                if STOP.is_set():
+                    break
                 # --- Etap 1: pobranie + parsowanie rownolegle (bez bazy) ---
                 results = []
-                if cache_only or workers <= 1:
+                if executor is None:
                     for snap in batch:
+                        if STOP.is_set():
+                            break
                         results.append(compute_correct_data(snap, cache_only, save_cache, scraper))
                         if use_bar:
                             progress.update(task, advance=1)
                 else:
-                    with ThreadPoolExecutor(max_workers=workers) as ex:
-                        futs = [ex.submit(compute_correct_data, s, cache_only, save_cache, scraper)
-                                for s in batch]
+                    futs = [executor.submit(compute_correct_data, s, cache_only, save_cache, scraper)
+                            for s in batch]
+                    try:
                         for fut in as_completed(futs):
                             results.append(fut.result())
                             if use_bar:
                                 progress.update(task, advance=1)
+                    except (KeyboardInterrupt, Interrupted):
+                        # Ctrl+C: porzuc niezakolejkowane, zapisz to co juz gotowe.
+                        request_stop()
+                        for f in futs:
+                            f.cancel()
 
                 # --- Etap 2: zapis tego okna (tylko watek glowny) ---
                 chunk_log = []
@@ -383,8 +397,12 @@ def repair(dry_run, cache_only, limit, workers, recheck, save_cache, fix_publish
                 logger.info(f"Postep: {processed}/{total_est} ({pct:.1f}%) | fix={counters['changed']} "
                             f"ok={counters['ok']} skip={counters['skipped']}{_rate()}")
         except KeyboardInterrupt:
+            request_stop()
             logger.warning("Przerwano (Ctrl+C). Postep tego i poprzednich okien zapisany - "
                            "uruchom ponownie, aby wznowic.")
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
 
     _print_summary(processed, counters, dry_run, fix_publisher, preview_rows)
 
