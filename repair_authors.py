@@ -37,6 +37,7 @@ import argparse
 import csv
 import os
 import sys
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -258,16 +259,27 @@ def repair(dry_run, cache_only, limit, workers, recheck, save_cache, fix_publish
     counters = {"changed": 0, "ok": 0, "skipped": 0, "pub_changed": 0}
     preview_rows = []
     chunk_size = max(workers * 8, 50)
+    processed = 0
 
-    with Progress(
+    # Pasek "rich" tylko w terminalu (TTY). Przez SSH/nohup (brak TTY) pasek by
+    # sie nie renderowal i smiecil - wtedy uzywamy wylacznie logow cyklicznych.
+    use_bar = console.is_terminal
+    progress_cm = Progress(
         SpinnerColumn(),
         TextColumn("[bold green]Naprawa autorow:[/bold green] {task.description}"),
         BarColumn(),
         TaskProgressColumn(),
-        TextColumn("[cyan]poprawione: {task.fields[fixed]} | bez zmian: {task.fields[ok]} | pominiete: {task.fields[skip]}"),
+        TextColumn("[cyan]fix: {task.fields[fixed]} | ok: {task.fields[ok]} | skip: {task.fields[skip]}"),
         TimeRemainingColumn(),
-    ) as progress:
-        task = progress.add_task("Start...", total=total, fixed=0, ok=0, skip=0)
+    ) if use_bar else nullcontext()
+
+    def _rate_info():
+        if scraper is None:
+            return ""
+        return f" | tempo: {scraper.rate_limiter.current_rps:.2f} zad/s"
+
+    with progress_cm as progress:
+        task = progress.add_task("Start...", total=total, fixed=0, ok=0, skip=0) if use_bar else None
         try:
             for i in range(0, total, chunk_size):
                 chunk = snapshots[i:i + chunk_size]
@@ -277,14 +289,16 @@ def repair(dry_run, cache_only, limit, workers, recheck, save_cache, fix_publish
                 if cache_only or workers <= 1:
                     for snap in chunk:
                         results.append(compute_correct_data(snap, cache_only, save_cache, scraper))
-                        progress.update(task, advance=1)
+                        if use_bar:
+                            progress.update(task, advance=1)
                 else:
                     with ThreadPoolExecutor(max_workers=workers) as executor:
                         futures = [executor.submit(compute_correct_data, snap, cache_only, save_cache, scraper)
                                    for snap in chunk]
                         for fut in as_completed(futures):
                             results.append(fut.result())
-                            progress.update(task, advance=1)
+                            if use_bar:
+                                progress.update(task, advance=1)
 
                 # --- Etap 2: zapis tej paczki (tylko watek glowny) ---
                 chunk_log = []
@@ -337,11 +351,17 @@ def repair(dry_run, cache_only, limit, workers, recheck, save_cache, fix_publish
                         session.commit()
 
                 _write_log(chunk_log)
-                progress.update(task, description=f"...ID {chunk[-1]['external_id']}",
-                                fixed=counters["changed"], ok=counters["ok"], skip=counters["skipped"])
+                processed += len(chunk)
+                if use_bar:
+                    progress.update(task, description=f"...ID {chunk[-1]['external_id']}",
+                                    fixed=counters["changed"], ok=counters["ok"], skip=counters["skipped"])
+                # Log cykliczny (trafia do pliku i stdout) - dziala takze przez SSH.
+                pct = processed * 100.0 / total
+                logger.info(f"Postep: {processed}/{total} ({pct:.1f}%) | fix={counters['changed']} "
+                            f"ok={counters['ok']} skip={counters['skipped']}{_rate_info()}")
         except KeyboardInterrupt:
-            progress.console.print("\n[yellow]Przerwano. Postep tej i poprzednich paczek zostal zapisany - "
-                                   "uruchom ponownie, aby wznowic.[/yellow]")
+            logger.warning("Przerwano (Ctrl+C). Postep tej i poprzednich paczek zostal zapisany - "
+                           "uruchom ponownie, aby wznowic.")
 
     _print_summary(total, counters, dry_run, fix_publisher, preview_rows)
 
@@ -394,10 +414,14 @@ def main():
     parser.add_argument("--recheck", action="store_true", help="Ignoruj postep - zweryfikuj ponownie wszystkie.")
     parser.add_argument("--save-cache", action="store_true", help="Zapisuj pobrany HTML do cache.")
     parser.add_argument("--fix-publisher", action="store_true", help="Popraw takze wydawce (data-ga-book-publishers).")
+    parser.add_argument("--log-file", default="logs/repair.log", help="Plik logu (rotowany). Domyslnie logs/repair.log.")
     args = parser.parse_args()
 
+    os.makedirs(os.path.dirname(args.log_file) or ".", exist_ok=True)
     logger.remove()
     logger.add(sys.stdout, level="INFO")
+    logger.add(args.log_file, rotation="20 MB", retention="14 days", level="INFO", encoding="utf-8")
+    logger.info(f"Logi zapisywane do: {args.log_file}")
 
     repair(
         dry_run=args.dry_run,

@@ -352,3 +352,45 @@ przepustowości (wątki i tak czekają na slot), ale nie powoduje już 429.
 | `scraper.py` | `request()` z rate-limitem + backoff 429/503 (`Retry-After`); użyte we wszystkich ścieżkach HTTP; nagłówki + sesja per-wątek w gap fillerze |
 | `tests/fixtures/book_kasacja.html` | **nowy** — fixture z realnego HTML |
 | `tests/test_parser_authors.py` | testy na realnym HTML (atrybut GA + ignorowanie pułapek + fallback) |
+
+
+
+---
+
+# Aktualizacja: praca na serwerze (SSH) i stabilizacja 429
+
+## Limiter AIMD (stabilne tempo zamiast oscylacji wokol 429)
+Wczesniejszy `recover()` mnozyl odstep przez 0.9 po kazdym sukcesie -> przy wielu
+watkach kilkanascie sukcesow kasowalo kare po 429 i serwer znow blokowal
+(oscylacja widoczna w logach). Limiter dziala teraz w schemacie **AIMD**:
+- **429/503 -> mnozenie odstepu** (gwaltowne zwolnienie),
+- **sukces -> odjecie malego, stalego kroku** (powolny powrot).
+Tempo samo ustala sie tuz ponizej progu blokady. Domyslne
+`REQUESTS_PER_SECOND` obnizone do **1.0**; reguluj flaga `--rps` (repair) lub
+zmienna `REQUESTS_PER_SECOND` (scraper).
+
+## Logi, postep, przerywanie, wznawianie (SSH-friendly)
+- `repair_authors.py`: pasek `rich` tylko w terminalu (TTY); przez SSH/`nohup`
+  wypisuje **cykliczny log postepu** (`Postep: X/Y (%) | fix/ok/skip | tempo`).
+  Logi do pliku: `--log-file` (domyslnie `logs/repair.log`, rotowany).
+- Tryby skanera ID / latania dziur (`scraper.py`): co 200 ID logują
+  `zapisane / 404 / bledy / tempo` do `logs/app.log` (widoczne bez TTY).
+- **Przerywanie**: `Ctrl+C` bezpieczne - postep zapisywany po kazdej paczce
+  (repair) / po kazdym ID (skaner). **Wznawianie**: ponowne uruchomienie pomija
+  zrobione (tabela `author_repair_progress` / istniejace rekordy + `archived_error`).
+
+## Przyklady uruchomienia na serwerze
+```bash
+# Naprawa bazy w tle, log do pliku, bezpieczne tempo:
+nohup python repair_authors.py --workers 6 --rps 1 --save-cache --fix-publisher \
+      --log-file logs/repair.log >/dev/null 2>&1 &
+tail -f logs/repair.log          # podglad postepu
+
+# Latanie dziur w tle:
+REQUESTS_PER_SECOND=1 nohup python main.py fill-gaps >/dev/null 2>&1 &
+tail -f logs/app.log
+
+# Wznowienie po przerwaniu - ta sama komenda; pomija juz zrobione.
+```
+Wskazowka: przy niskim `--rps` duzo watkow nie przyspieszy (czekaja na slot
+limitera) - 4-8 watkow w zupelnosci wystarcza.

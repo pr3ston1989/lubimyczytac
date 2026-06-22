@@ -405,12 +405,22 @@ class Scraper:
             task = progress.add_task("Uruchamianie...", total=len(missing_ids))
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 batch_size = 5000
+                done = saved = miss = err = 0
                 try:
                     for i in range(0, len(missing_ids), batch_size):
                         batch = missing_ids[i : i + batch_size]
                         futures = {executor.submit(self._process_gap_id, cid, progress, task): cid for cid in batch}
                         for future in as_completed(futures):
-                            future.result() 
+                            msg = future.result()
+                            done += 1
+                            if msg.startswith("Zapisano"): saved += 1
+                            elif msg.startswith("Pudlo"): miss += 1
+                            elif msg.startswith("Blad"): err += 1
+                            # Log cykliczny (plik + stdout) - widoczny przez SSH/nohup.
+                            if done % 200 == 0:
+                                logger.info(f"Latanie dziur: {done}/{len(missing_ids)} | "
+                                            f"zapisane={saved} 404={miss} bledy={err} | "
+                                            f"tempo={self.rate_limiter.current_rps:.2f} zad/s")
                 except KeyboardInterrupt:
                     progress.console.print("\n[bold red]Zatrzymywanie pajakow (to moze zajac kilka sekund)...[/bold red]")
                     for future in futures:
@@ -459,12 +469,21 @@ class Scraper:
             task = progress.add_task("Skanowanie...", total=len(missing_ids))
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 batch_size = 5000
+                done = saved = miss = err = 0
                 try:
                     for i in range(0, len(missing_ids), batch_size):
                         batch = missing_ids[i : i + batch_size]
                         futures = {executor.submit(self._process_gap_id, cid, progress, task): cid for cid in batch}
                         for future in as_completed(futures):
-                            future.result()
+                            msg = future.result()
+                            done += 1
+                            if msg.startswith("Zapisano"): saved += 1
+                            elif msg.startswith("Pudlo"): miss += 1
+                            elif msg.startswith("Blad"): err += 1
+                            if done % 200 == 0:
+                                logger.info(f"Skaner ID: {done}/{len(missing_ids)} | "
+                                            f"zapisane={saved} 404={miss} bledy={err} | "
+                                            f"tempo={self.rate_limiter.current_rps:.2f} zad/s")
                 except KeyboardInterrupt:
                     progress.console.print("\n[bold red]Zatrzymywanie skanera ID...[/bold red]")
                     for future in futures:
