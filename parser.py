@@ -1,4 +1,5 @@
 import re
+import json
 from bs4 import BeautifulSoup
 from loguru import logger
 from typing import Optional, List, Dict, Any
@@ -55,6 +56,37 @@ def _split_ga_list(value: Optional[str]) -> List[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
 
 
+def _extract_jsonld_authors(soup) -> List[str]:
+    """Autorzy z JSON-LD (script type=application/ld+json, @type=Book).
+
+    To najbardziej odporne zrodlo - dane strukturalne ustawiane przez serwis,
+    niezalezne od ukladu HTML. author moze byc dict, lista lub string.
+    """
+    names: List[str] = []
+    for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        raw = tag.string or tag.get_text() or ""
+        if '"Book"' not in raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        candidates = data if isinstance(data, list) else [data]
+        for obj in candidates:
+            if not isinstance(obj, dict) or obj.get("@type") != "Book":
+                continue
+            author = obj.get("author")
+            items = author if isinstance(author, list) else [author]
+            for a in items:
+                if isinstance(a, dict) and a.get("name"):
+                    names.append(a["name"].strip())
+                elif isinstance(a, str) and a.strip():
+                    names.append(a.strip())
+            if names:
+                return names
+    return names
+
+
 def extract_authors(soup) -> List[Dict[str, Any]]:
     """Wyciaga TYLKO autorow danej ksiazki.
 
@@ -64,25 +96,34 @@ def extract_authors(soup) -> List[Dict[str, Any]]:
     wszystkich powoduje przypisanie losowych, obcych autorow.
 
     Strategia (od najbardziej do najmniej wiarygodnej):
-      1) atrybut ``data-ga-book-authors`` na kontenerze ksiazki - ustawiany przez
-         sam serwis (analytics), zawiera DOKLADNIE autorow tej ksiazki;
-      2) link autora w naglowku (``span.author`` / ``.book__author``);
-      3) ostatecznie ``a.link-name`` (nigdy cala strona).
+      1) JSON-LD (@type=Book) - dane strukturalne, najodporniejsze;
+      2) atrybut ``data-ga-book-authors`` na kontenerze ksiazki;
+      3) link autora w naglowku (``span.author`` / ``.book__author``);
+      4) ostatecznie ``a.link-name`` (nigdy cala strona).
     """
     authors: List[Dict[str, Any]] = []
     seen = set()
 
-    # 1) Najpewniejsze zrodlo - atrybut data-ga-book-authors.
+    def _add(name):
+        if name and name not in seen:
+            seen.add(name)
+            authors.append({"name": name})
+
+    # 1) JSON-LD - najpewniejsze, niezalezne od ukladu HTML.
+    for name in _extract_jsonld_authors(soup):
+        _add(name)
+    if authors:
+        return authors
+
+    # 2) atrybut data-ga-book-authors.
     ga = soup.select_one("[data-ga-book-authors]")
     if ga is not None:
         for name in _split_ga_list(ga.get("data-ga-book-authors")):
-            if name not in seen:
-                seen.add(name)
-                authors.append({"name": name})
+            _add(name)
         if authors:
             return authors
 
-    # 2) Fallback - zakres ograniczony do naglowka ksiazki.
+    # 3) Fallback - zakres ograniczony do naglowka ksiazki.
     scope = None
     for selector in AUTHOR_CONTAINER_SELECTORS:
         scope = soup.select_one(selector)
@@ -92,16 +133,13 @@ def extract_authors(soup) -> List[Dict[str, Any]]:
     if scope is not None:
         candidate_links = scope.select("a[href*='/autor/']")
     else:
-        # 3) Ostatecznosc - tylko jawnie oznaczone linki, nigdy cala strona.
+        # 4) Ostatecznosc - tylko jawnie oznaczone linki, nigdy cala strona.
         candidate_links = soup.select(
             "span.author a[href*='/autor/'], a.link-name[href*='/autor/']"
         )
 
     for a in candidate_links:
-        name = a.get_text(strip=True)
-        if name and name not in seen:
-            seen.add(name)
-            authors.append({"name": name})
+        _add(a.get_text(strip=True))
 
     return authors
 

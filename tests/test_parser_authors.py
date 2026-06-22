@@ -134,3 +134,46 @@ def test_ga_author_fallback_to_span_author():
     html = _load_fixture().replace('data-ga-book-authors="Remigiusz Mroz"', "")
     data = extract_book_info(html, "https://lubimyczytac.pl/ksiazka/245373/kasacja")
     assert data["authors"] == [{"name": "Remigiusz Mroz"}]
+
+
+
+# --- Testy JSON-LD (najodporniejsze zrodlo autora) ---
+
+JSONLD_PAGE = """<html><body>
+<script type="application/ld+json">
+{"@context":"http://schema.org","@type":"Book","name":"Tytul",
+ "author":{"@type":"Person","name":"Slawek Gortych"},
+ "isbn":"9788383878720","numberOfPages":"416"}
+</script>
+<section class="container book" data-ga-book-authors="ZLY Autor Z GA"
+         data-ga-book-publishers="W.A.B.">
+  <h1 class="book__title">Schronisko</h1>
+  <span class="author"><a href="/autor/231269/x">Inny Naglowek</a></span>
+  <section class="recommended-books"><a href="/autor/9/obcy">Obcy</a></section>
+</section>
+</body></html>"""
+
+
+def test_jsonld_author_has_priority():
+    """JSON-LD ma pierwszenstwo przed data-ga i naglowkiem."""
+    data = extract_book_info(JSONLD_PAGE, "https://lubimyczytac.pl/ksiazka/5189210/schronisko")
+    assert data["authors"] == [{"name": "Slawek Gortych"}]
+
+
+def test_jsonld_multiple_authors():
+    html = """<html><body>
+    <script type="application/ld+json">
+    {"@type":"Book","name":"X","author":[{"@type":"Person","name":"Autor A"},
+     {"@type":"Person","name":"Autor B"}]}
+    </script>
+    <h1 class="book__title">X</h1></body></html>"""
+    data = extract_book_info(html, "https://lubimyczytac.pl/ksiazka/1/x")
+    assert data["authors"] == [{"name": "Autor A"}, {"name": "Autor B"}]
+
+
+def test_jsonld_malformed_falls_back_to_ga():
+    """Uszkodzony JSON-LD nie wysypuje parsera - schodzi do data-ga."""
+    html = JSONLD_PAGE.replace('"author":{"@type":"Person","name":"Slawek Gortych"},', '"author": ,,,')
+    data = extract_book_info(html, "https://lubimyczytac.pl/ksiazka/5189210/schronisko")
+    # Niepoprawny JSON pomijany; data-ga przejmuje (ZLY Autor Z GA to tu jedyne wiarygodne zrodlo)
+    assert data["authors"] == [{"name": "ZLY Autor Z GA"}]

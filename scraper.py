@@ -194,15 +194,29 @@ class Scraper:
     def enqueue_spider_links(self, links_data: list, db_session):
         if not links_data:
             return
-        valid_links = []
+        # Zbierz ext_id wszystkich kandydatow-ksiazek i sprawdz istnienie JEDNYM
+        # zapytaniem (zamiast osobnego SELECT na kazdy link - przy stronach-listach
+        # to setki zapytan). Reszta (listy/autorzy/kategorie) przechodzi dalej.
+        candidates = []
+        ext_ids = set()
         for item in links_data:
-            url = item["url"]
-            match = re.search(r"/(ksiazka|audiobook)/(\d+)/", url)
+            match = re.search(r"/(ksiazka|audiobook)/(\d+)/", item["url"])
             if match:
                 ext_id = int(match.group(2))
-                exists = db_session.query(Book).filter_by(external_id=ext_id).first()
-                if exists:
-                    continue
+                item["_ext_id"] = ext_id
+                ext_ids.add(ext_id)
+            candidates.append(item)
+
+        existing = set()
+        if ext_ids:
+            rows = db_session.query(Book.external_id).filter(Book.external_id.in_(ext_ids)).all()
+            existing = {r[0] for r in rows}
+
+        valid_links = []
+        for item in candidates:
+            ext_id = item.pop("_ext_id", None)
+            if ext_id is not None and ext_id in existing:
+                continue
             valid_links.append(item)
         if valid_links:
             add_many_to_queue(valid_links)
