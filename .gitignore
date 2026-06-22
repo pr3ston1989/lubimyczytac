@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.python-version
+
+# Wirtualne srodowiska
+.venv/
+venv/
+
+# Dane lokalne / cache / logi scrapera
+data/
+*.db
+*.db-wal
+*.db-shm
+repair_log.csv

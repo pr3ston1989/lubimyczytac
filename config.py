@@ -9,6 +9,12 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 MIN_DELAY = float(os.getenv("MIN_DELAY", 1.0))
 MAX_DELAY = float(os.getenv("MAX_DELAY", 3.0))
 
+# Globalny limit LACZNEJ liczby zadan na sekunde (wszystkie watki razem).
+# To, a nie liczba watkow, chroni przed HTTP 429. Zacznij nisko (1-2) i zwiekszaj.
+REQUESTS_PER_SECOND = float(os.getenv("REQUESTS_PER_SECOND", 2.0))
+# Maksymalna liczba ponowien przy bledach przejsciowych (429/503/sieć).
+MAX_HTTP_RETRIES = int(os.getenv("MAX_HTTP_RETRIES", 4))
+
 # Rotujące User-Agenty
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
