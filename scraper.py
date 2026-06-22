@@ -13,7 +13,8 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 
 import config
 from ratelimit import RateLimiter
-from runtime import STOP, interruptible_sleep, request_stop, Interrupted
+from runtime import (STOP, interruptible_sleep, request_stop, Interrupted,
+                     iter_done, install_sigint, restore_sigint)
 from database import get_session
 from sqlalchemy import func
 from models import Book, Author, Publisher, Series, Category, Cover, Review, ScrapeQueue
@@ -283,6 +284,7 @@ class Scraper:
             # wyjscie czeka na wszystkie zakolejkowane zadania (przy Ctrl+C =
             # wiszenie). Sterujemy zamknieciem recznie.
             executor = ThreadPoolExecutor(max_workers=self.max_workers)
+            prev_sigint = install_sigint()
             try:
                 while not STOP.is_set():
                     batch = get_batch_queue(limit=self.max_workers * 4)
@@ -290,12 +292,13 @@ class Scraper:
                         break
                     futures = {executor.submit(self.process_single_item, item): item for item in batch}
                     try:
-                        for future in as_completed(futures):
+                        for future in iter_done(futures):
                             status_msg = future.result()
                             processed_count += 1
                             progress.update(task, description=status_msg, completed=processed_count)
                     except KeyboardInterrupt:
                         request_stop()
+                    if STOP.is_set():
                         progress.console.print("\n[bold red]Zatrzymywanie (Ctrl+C)... porzucam kolejke paczki.[/bold red]")
                         for f in futures:
                             f.cancel()
@@ -304,6 +307,7 @@ class Scraper:
                         new_pending = session.query(ScrapeQueue).filter_by(status='pending').count()
                     progress.update(task, total=processed_count + new_pending)
             finally:
+                restore_sigint(prev_sigint)
                 executor.shutdown(wait=False, cancel_futures=True)
 
     def seed_start_urls(self):
@@ -438,6 +442,7 @@ class Scraper:
         ) as progress:
             task = progress.add_task("Uruchamianie...", total=len(missing_ids))
             executor = ThreadPoolExecutor(max_workers=self.max_workers)
+            prev_sigint = install_sigint()
             batch_size = 5000
             done = saved = miss = err = 0
             try:
@@ -447,7 +452,7 @@ class Scraper:
                     batch = missing_ids[i : i + batch_size]
                     futures = {executor.submit(self._process_gap_id, cid, progress, task): cid for cid in batch}
                     try:
-                        for future in as_completed(futures):
+                        for future in iter_done(futures):
                             msg = future.result()
                             done += 1
                             if msg.startswith("Zapisano"): saved += 1
@@ -459,11 +464,13 @@ class Scraper:
                                             f"tempo={self.rate_limiter.current_rps:.2f} zad/s")
                     except KeyboardInterrupt:
                         request_stop()
+                    if STOP.is_set():
                         progress.console.print("\n[bold red]Zatrzymywanie (Ctrl+C)... porzucam reszte ID.[/bold red]")
                         for f in futures:
                             f.cancel()
                         break
             finally:
+                restore_sigint(prev_sigint)
                 executor.shutdown(wait=False, cancel_futures=True)
 
     def run_custom_id_scanner(self, start_id: int, direction: str = "up", count: int = 20000):
@@ -506,6 +513,7 @@ class Scraper:
         ) as progress:
             task = progress.add_task("Skanowanie...", total=len(missing_ids))
             executor = ThreadPoolExecutor(max_workers=self.max_workers)
+            prev_sigint = install_sigint()
             batch_size = 5000
             done = saved = miss = err = 0
             try:
@@ -515,7 +523,7 @@ class Scraper:
                     batch = missing_ids[i : i + batch_size]
                     futures = {executor.submit(self._process_gap_id, cid, progress, task): cid for cid in batch}
                     try:
-                        for future in as_completed(futures):
+                        for future in iter_done(futures):
                             msg = future.result()
                             done += 1
                             if msg.startswith("Zapisano"): saved += 1
@@ -527,9 +535,11 @@ class Scraper:
                                             f"tempo={self.rate_limiter.current_rps:.2f} zad/s")
                     except KeyboardInterrupt:
                         request_stop()
+                    if STOP.is_set():
                         progress.console.print("\n[bold red]Zatrzymywanie skanera ID (Ctrl+C)...[/bold red]")
                         for f in futures:
                             f.cancel()
                         break
             finally:
+                restore_sigint(prev_sigint)
                 executor.shutdown(wait=False, cancel_futures=True)

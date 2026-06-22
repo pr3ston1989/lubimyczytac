@@ -43,7 +43,8 @@ from rich.progress import (Progress, SpinnerColumn, TextColumn, BarColumn,
 from sqlalchemy import select, text, func
 
 import config
-from runtime import STOP, request_stop, Interrupted
+from runtime import (STOP, request_stop, Interrupted, iter_done,
+                     install_sigint, restore_sigint)
 from database import get_session, init_db
 from models import Book, Author, Publisher, book_authors
 from parser import extract_book_info
@@ -315,6 +316,7 @@ def repair(dry_run, cache_only, limit, workers, recheck, save_cache, fix_publish
     # Jeden executor na cale uruchomienie. Bez 'with' - sterujemy zamknieciem
     # recznie, by Ctrl+C nie czekal na wszystkie zakolejkowane zadania.
     executor = ThreadPoolExecutor(max_workers=workers) if not (cache_only or workers <= 1) else None
+    prev_sigint = install_sigint()
 
     with progress_cm as progress:
         task = progress.add_task("start", total=total_est, fixed=0, ok=0, skip=0) if use_bar else None
@@ -335,13 +337,14 @@ def repair(dry_run, cache_only, limit, workers, recheck, save_cache, fix_publish
                     futs = [executor.submit(compute_correct_data, s, cache_only, save_cache, scraper)
                             for s in batch]
                     try:
-                        for fut in as_completed(futs):
+                        for fut in iter_done(futs):
                             results.append(fut.result())
                             if use_bar:
                                 progress.update(task, advance=1)
                     except (KeyboardInterrupt, Interrupted):
-                        # Ctrl+C: porzuc niezakolejkowane, zapisz to co juz gotowe.
                         request_stop()
+                    if STOP.is_set():
+                        # Ctrl+C: porzuc niezakolejkowane, zapisz to co juz gotowe.
                         for f in futs:
                             f.cancel()
 
@@ -403,6 +406,7 @@ def repair(dry_run, cache_only, limit, workers, recheck, save_cache, fix_publish
         finally:
             if executor is not None:
                 executor.shutdown(wait=False, cancel_futures=True)
+            restore_sigint(prev_sigint)
 
     _print_summary(processed, counters, dry_run, fix_publisher, preview_rows)
 
