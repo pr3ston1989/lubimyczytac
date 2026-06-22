@@ -36,6 +36,7 @@ class RateLimiter:
         self._decrease_step = max(self._base_interval * decrease_ratio, 0.02)
         self._jitter = jitter
         self._next_time = 0.0
+        self._last_penalty = 0.0
         self._lock = threading.Lock()
 
     def wait(self):
@@ -52,8 +53,17 @@ class RateLimiter:
             interruptible_sleep(delay)
 
     def penalize(self):
-        """Po 429/503 MNOZY odstep (gwaltowne zwolnienie, do max_interval)."""
+        """Po 429/503 MNOZY odstep (gwaltowne zwolnienie, do max_interval).
+
+        WAZNE przy wielu watkach: kilka 429 przychodzi naraz. Bez ochrony odstep
+        rosnie lawinowo (x2 x2 x2... -> bezruch). Dlatego podbijamy odstep
+        NAJWYZEJ raz na biezacy interwal - jeden "cios" na rzut 429, nie osiem.
+        """
         with self._lock:
+            now = time.monotonic()
+            if now - self._last_penalty < max(self._interval, 1.0):
+                return
+            self._last_penalty = now
             self._interval = min(self._interval * self._increase_factor, self._max_interval)
 
     def recover(self):

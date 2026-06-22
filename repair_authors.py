@@ -467,7 +467,7 @@ def main():
     parser.add_argument("--limit", type=int, default=0, help="Maks. liczba ksiazek w tym uruchomieniu (0 = wszystkie).")
     parser.add_argument("--workers", type=int, default=1, help="Watki pobierajace (zapisy zawsze 1-watkowe).")
     parser.add_argument("--rps", type=float, default=0.0, help="Globalne tempo zadan/s (np. 2).")
-    parser.add_argument("--window", type=int, default=400, help="Rozmiar okna ksiazek trzymanych w pamieci.")
+    parser.add_argument("--window", type=int, default=200, help="Rozmiar okna ksiazek trzymanych w pamieci (mniejsze = czesciej widac postep i zapis).")
     parser.add_argument("--recheck", action="store_true", help="Ignoruj postep - zweryfikuj ponownie wszystkie.")
     parser.add_argument("--save-cache", action="store_true", help="Zapisuj pobrany HTML do cache.")
     parser.add_argument("--fix-publisher", action="store_true", help="Popraw takze wydawce.")
