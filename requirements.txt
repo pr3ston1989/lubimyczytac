@@ -1,0 +1,10 @@
+requests>=2.31.0
+beautifulsoup4>=4.12.3
+lxml>=5.1.0
+SQLAlchemy>=2.0.28
+tqdm>=4.66.2
+loguru>=0.7.2
+python-dotenv>=1.0.1
+Pillow>=10.2.0
+rich>=13.7.0
+curl_cffi
