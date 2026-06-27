@@ -1,12 +1,9 @@
 import time
-import requests
 import re
 import os
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from curl_cffi import requests as cureq
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from loguru import logger
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
@@ -14,7 +11,7 @@ import config
 from database import get_session
 from sqlalchemy import func
 from models import Book, Author, Publisher, Series, Category, Cover, Review, ScrapeQueue
-from parser import extract_book_info, extract_links, extract_reviews
+from parser import extract_book_info, extract_links, extract_reviews, generate_pagination_urls
 from downloader import download_cover
 from progress import add_to_queue, get_next_in_queue, mark_queue_status, mark_queue_failed, log_error, add_many_to_queue, get_batch_queue, mark_status
 
@@ -59,6 +56,24 @@ class Scraper:
             )
             db_session.add(book)
             db_session.flush()
+        else:
+            # Aktualizacja istniejacego rekordu - uzupelniaj brakujace pola, aktualizuj rating
+            if data['avg_rating'] is not None:
+                book.avg_rating = data['avg_rating']
+            if data['description'] and not book.description:
+                book.description = data['description']
+            if data['pages'] and not book.pages:
+                book.pages = data['pages']
+            if data['isbn'] and not book.isbn:
+                book.isbn = data['isbn']
+            if data['release_date'] and not book.release_date:
+                book.release_date = data['release_date']
+            if data['original_title'] and not book.original_title:
+                book.original_title = data['original_title']
+            if data.get('duration_minutes') and not book.duration_minutes:
+                book.duration_minutes = data['duration_minutes']
+            if data['translator'] and not book.translator:
+                book.translator = data['translator']
 
         if data.get('cover_url'):
             if not db_session.query(Cover).filter_by(book_id=book.id).first():
@@ -124,16 +139,32 @@ class Scraper:
     def enqueue_spider_links(self, links_data: list, db_session):
         if not links_data:
             return
+        
+        # Zbierz wszystkie external_id ksiazek do sprawdzenia w jednym zapytaniu
+        book_ids_to_check = {}
+        for item in links_data:
+            match = re.search(r"/(ksiazka|audiobook)/(\d+)/", item["url"])
+            if match:
+                book_ids_to_check[int(match.group(2))] = item
+        
+        # Jedno zapytanie zamiast N
+        existing_ids = set()
+        if book_ids_to_check:
+            existing_ids = set(
+                r[0] for r in db_session.query(Book.external_id)
+                .filter(Book.external_id.in_(list(book_ids_to_check.keys())))
+                .all()
+            )
+        
         valid_links = []
         for item in links_data:
-            url = item["url"]
-            match = re.search(r"/(ksiazka|audiobook)/(\d+)/", url)
+            match = re.search(r"/(ksiazka|audiobook)/(\d+)/", item["url"])
             if match:
                 ext_id = int(match.group(2))
-                exists = db_session.query(Book).filter_by(external_id=ext_id).first()
-                if exists:
+                if ext_id in existing_ids:
                     continue
             valid_links.append(item)
+        
         if valid_links:
             add_many_to_queue(valid_links)
 
@@ -143,29 +174,57 @@ class Scraper:
         try:
             delay = random.uniform(config.MIN_DELAY, config.MAX_DELAY)
             time.sleep(delay)
-            res = self.session.get(url, timeout=15)
+            # Kazdy watek tworzy wlasna sesje HTTP (curl_cffi nie jest thread-safe)
+            with cureq.Session(impersonate="chrome120") as local_session:
+                res = local_session.get(url, timeout=15, allow_redirects=True)
             if res.status_code == 404:
                 mark_status(item_id, "archived_error")
                 return f"Pudlo 404: {url.split('/')[-1]}"
+            # Dla stron paginacyjnych: jesli serwer przekierowal na inna strone
+            # (np. /katalog bez ?page=), to oznacza koniec paginacji
+            final_url_str = str(res.url) if hasattr(res, 'url') and res.url else url
+            if item_dict["type"] == "list" and "page=" in url and "page=" not in final_url_str:
+                mark_status(item_id, "archived_error")
+                return f"Koniec paginacji: {url.split('/')[-1]}"
             res.raise_for_status()
             with get_session() as db_session:
                 if item_dict["type"] == "book":
-                    self.process_book_page(url, res.text, db_session)
+                    # Uzyj finalnego URL po ewentualnych redirectach
+                    final_url = str(res.url) if hasattr(res, 'url') and res.url else url
+                    self.process_book_page(final_url, res.text, db_session)
                     if self.mode == "spider":
                         discovered_links = extract_links(res.text)
                         self.enqueue_spider_links(discovered_links, db_session)
                 elif item_dict["type"] == "list":
                     discovered_links = extract_links(res.text)
+                    
+                    # Jesli strona paginacyjna nie zawiera zadnych linkow do ksiazek,
+                    # oznacza to koniec paginacji - nie generuj wiecej stron.
+                    has_book_links = any(link["type"] == "book" for link in discovered_links)
+                    
+                    # Proaktywna paginacja: jesli to pierwsza strona listy (bez ?page=),
+                    # generuj linki do kolejnych stron, bo paginacja moze byc JS-owa.
+                    if "page=" not in url and has_book_links:
+                        pagination_links = generate_pagination_urls(url, max_pages=50)
+                        discovered_links.extend(pagination_links)
+                    
                     self.enqueue_spider_links(discovered_links, db_session)
             mark_status(item_id, "completed")
             return f"Zapisano: {url.split('/')[-1][:30]}"
         except Exception as e:
             logger.error(f"Blad dla {url}: {e}")
-            mark_status(item_id, "error")
+            mark_queue_failed(item_id)
             return f"Blad: {url.split('/')[-1][:20]}"
 
     def run_queue(self):
+        # Cleanup: przywroc status "pending" elementom ktore utknely w "processing"
+        # (np. po crash programu)
         with get_session() as s:
+            stuck = s.query(ScrapeQueue).filter_by(status='processing').count()
+            if stuck > 0:
+                s.query(ScrapeQueue).filter_by(status='processing').update({"status": "pending"})
+                s.commit()
+                logger.info(f"Przywrocono {stuck} zadan ze statusu 'processing' do 'pending'.")
             total_tasks = s.query(ScrapeQueue).filter_by(status='pending').count()
         if total_tasks == 0:
             print("Kolejka jest pusta!")
@@ -193,7 +252,65 @@ class Scraper:
                             progress.update(task, description=status_msg, completed=processed_count, total=processed_count + new_pending)
 
     def seed_start_urls(self):
-        starts = ["https://lubimyczytac.pl/katalog", "https://lubimyczytac.pl/ksiazki/nowosci"]
+        starts = [
+            # Główne katalogi
+            "https://lubimyczytac.pl/katalog",
+            "https://lubimyczytac.pl/katalog/ksiazki",
+            "https://lubimyczytac.pl/ksiazki/nowosci",
+            "https://lubimyczytac.pl/ksiazki/zapowiedzi",
+            "https://lubimyczytac.pl/ksiazki/nowosci-i-zapowiedzi",
+            "https://lubimyczytac.pl/katalog/ostatnio-wydane",
+            # Popularne autorzy i cykle
+            "https://lubimyczytac.pl/autorzy",
+            "https://lubimyczytac.pl/cykle",
+            # Tagi - glowna strona z lista tagow
+            "https://lubimyczytac.pl/ksiazki/tagi",
+            # Strony zbiorcze z linkami do ksiazek
+            "https://lubimyczytac.pl/ksiazki/kategorie",
+            "https://lubimyczytac.pl/patronaty",
+            "https://lubimyczytac.pl/autorzy/popularni",
+            # Kategorie - wszystkie glowne podkategorie
+            "https://lubimyczytac.pl/kategoria/beletrystyka/fantasy-science-fiction",
+            "https://lubimyczytac.pl/kategoria/beletrystyka/horror",
+            "https://lubimyczytac.pl/kategoria/beletrystyka/klasyka",
+            "https://lubimyczytac.pl/kategoria/beletrystyka/kryminal-sensacja-thriller",
+            "https://lubimyczytac.pl/kategoria/beletrystyka/literatura-mlodziezowa",
+            "https://lubimyczytac.pl/kategoria/beletrystyka/literatura-obyczajowa-romans",
+            "https://lubimyczytac.pl/kategoria/beletrystyka/literatura-piekna",
+            "https://lubimyczytac.pl/kategoria/beletrystyka/powiesc-historyczna",
+            "https://lubimyczytac.pl/kategoria/beletrystyka/powiesc-przygodowa",
+            "https://lubimyczytac.pl/kategoria/beletrystyka/romantasy",
+            "https://lubimyczytac.pl/kategoria/literatura-faktu/biografia-autobiografia-pamietnik",
+            "https://lubimyczytac.pl/kategoria/literatura-faktu/reportaz",
+            "https://lubimyczytac.pl/kategoria/literatura-faktu/literatura-podroznicza",
+            "https://lubimyczytac.pl/kategoria/literatura-faktu/publicystyka-literacka-eseje",
+            "https://lubimyczytac.pl/kategoria/literatura-popularnonaukowa/historia",
+            "https://lubimyczytac.pl/kategoria/literatura-popularnonaukowa/popularnonaukowa",
+            "https://lubimyczytac.pl/kategoria/literatura-popularnonaukowa/nauki-spoleczne-psychologia-socjologia-itd",
+            "https://lubimyczytac.pl/kategoria/literatura-popularnonaukowa/biznes-finanse",
+            "https://lubimyczytac.pl/kategoria/literatura-popularnonaukowa/filozofia-etyka",
+            "https://lubimyczytac.pl/kategoria/literatura-popularnonaukowa/zdrowie-medycyna",
+            "https://lubimyczytac.pl/kategoria/literatura-dziecieca/literatura-dziecieca",
+            "https://lubimyczytac.pl/kategoria/literatura-dziecieca/bajki",
+            "https://lubimyczytac.pl/kategoria/komiksy/komiksy",
+            "https://lubimyczytac.pl/kategoria/poezja-dramat-satyra/poezja",
+            "https://lubimyczytac.pl/kategoria/pozostale/poradniki",
+            "https://lubimyczytac.pl/kategoria/pozostale/religia",
+            "https://lubimyczytac.pl/kategoria/pozostale/hobby",
+            # Popularne tagi - bezposrednie listy ksiazek po tagu
+            "https://lubimyczytac.pl/ksiazki/t/romans",
+            "https://lubimyczytac.pl/ksiazki/t/fantasy",
+            "https://lubimyczytac.pl/ksiazki/t/manga",
+            "https://lubimyczytac.pl/ksiazki/t/historia",
+            "https://lubimyczytac.pl/ksiazki/t/thriller",
+            "https://lubimyczytac.pl/ksiazki/t/horror",
+            "https://lubimyczytac.pl/ksiazki/t/science%20fiction",
+            "https://lubimyczytac.pl/ksiazki/t/biografia",
+            "https://lubimyczytac.pl/ksiazki/t/klasyka",
+            "https://lubimyczytac.pl/ksiazki/t/dla%20dzieci",
+            "https://lubimyczytac.pl/ksiazki/t/young%20adult",
+            "https://lubimyczytac.pl/ksiazki/t/komiks",
+        ]
         with get_session() as session:
             for url in starts:
                 existing = session.query(ScrapeQueue).filter_by(url=url).first()
@@ -239,13 +356,17 @@ class Scraper:
                                 self.process_book_page(final_url, response.text, db_session)
                             else:
                                 logger.debug(f"Ksiazka {ext_id} juz jest w bazie. Pomijam.")
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Blad sieci przy ID {current_id}: {e}. Czekam 60s przed ponowna proba.")
-                time.sleep(60)
-                current_id -= 1
             except Exception as e:
-                logger.error(f"Nieoczekiwany blad przy ID {current_id}: {e}")
-                log_error(url_to_check, str(e))
+                err_str = str(e).lower()
+                # Bledy sieciowe / HTTP - tymczasowe, ponow probe
+                if any(x in err_str for x in ['timeout', 'connection', 'network', 'reset', 'refused', 'ssl']):
+                    logger.error(f"Blad sieci przy ID {current_id}: {e}. Czekam 60s przed ponowna proba.")
+                    time.sleep(60)
+                    current_id -= 1
+                else:
+                    # Inne bledy (parsowanie, logika) - loguj i idz dalej
+                    logger.error(f"Nieoczekiwany blad przy ID {current_id}: {e}")
+                    log_error(url_to_check, str(e))
 
     def _process_gap_id(self, current_id: int, progress, task) -> str:
         url_to_check = f"https://lubimyczytac.pl/ksiazka/{current_id}/a"

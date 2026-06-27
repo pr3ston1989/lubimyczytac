@@ -1,5 +1,6 @@
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
+from contextlib import contextmanager
 from models import Base
 
 DATABASE_URL = "sqlite:///data/database.db"
@@ -22,5 +23,14 @@ def init_db():
     os.makedirs("data", exist_ok=True)
     Base.metadata.create_all(engine)
 
+@contextmanager
 def get_session():
-    return SessionLocal()
+    """Context manager ktory poprawnie zamyka sesje i robi rollback przy bledzie."""
+    session = SessionLocal()
+    try:
+        yield session
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()

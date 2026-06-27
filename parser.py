@@ -87,14 +87,27 @@ def extract_book_info(html: str, url: str) -> Optional[Dict[str, Any]]:
     if rating:
         data['avg_rating'] = clean_float(rating.get_text())
 
-    # Autorzy
-    for a in soup.select("a[href*='/autor/']"):
-        name = a.get_text(strip=True)
-        if name and {"name": name} not in data['authors']:
-            data['authors'].append({"name": name})
-
     # Szczegoly ksiazki (tabela dt/dd)
     details_div = soup.select_one("#book-details")
+    
+    # Autorzy - BEZPIECZNA EKSTRAKCJA
+    # Strategia: Na lubimyczytac.pl autor(zy) ksiazki sa wymienieni tuz pod tytulem h1,
+    # PRZED jakakolwiek sekcja z naglowkiem h2. Sekcje "Inne ksiazki autora",
+    # "Czytelnicy przeczytali" itp. zaczynaja sie od h2.
+    # Dlatego: zbierz linki /autor/ ktore pojawiaja sie PRZED pierwszym wystapienie
+    # naglowka h2 na stronie (po h1 z tytulem).
+    
+    if h1:
+        # Zbierz elementy nastepujace po h1 az do pierwszego h2
+        for sibling in h1.find_all_next():
+            if sibling.name == 'h2':
+                break  # Dotarlismy do sekcji - koniec szukania autorow
+            if sibling.name == 'a' and sibling.get('href', ''):
+                href = sibling['href']
+                if '/autor/' in href:
+                    name = sibling.get_text(strip=True)
+                    if name and {"name": name} not in data['authors']:
+                        data['authors'].append({"name": name})
     if details_div:
         dts = details_div.find_all('dt')
         dds = details_div.find_all('dd')
@@ -200,6 +213,25 @@ def extract_reviews(html: str) -> List[Dict[str, Any]]:
         
     return reviews_data
 
+def _clean_list_url(href: str) -> str:
+    """Oczyszcza URL typu 'list' zachowując parametr paginacji (page=N) i filtry katalogowe."""
+    url = href.split('#')[0]
+    if "?" in url:
+        base, query = url.split('?', 1)
+        # Dla stron katalogowych z filtrami (/katalog/ksiazki?...) - zachowaj caly query string
+        if "/katalog/" in base:
+            # Zachowaj pelny query string (zawiera filtry category[], authors[] itp.)
+            url = f"{base}?{query}"
+        else:
+            # Dla pozostalych stron (autorzy, cykle, tagi) - zachowaj tylko page=
+            page_match = re.search(r'(?:^|&)(page=\d+)', query)
+            if page_match:
+                url = f"{base}?{page_match.group(1)}"
+            else:
+                url = base
+    return url
+
+
 def extract_links(html: str) -> List[Dict[str, Any]]:
     soup = BeautifulSoup(html, 'lxml')
     links = []
@@ -209,35 +241,102 @@ def extract_links(html: str) -> List[Dict[str, Any]]:
         href = a['href']
         if href.startswith('/'):
             href = "https://lubimyczytac.pl" + href
-            
-        # Oczyszczanie linku z kotwic (#) oraz parametrów sortowania (?)
+        
+        # Ignoruj linki spoza domeny
+        if not href.startswith("https://lubimyczytac.pl"):
+            continue
+
+        # Usun kotwice
         url = href.split('#')[0]
-        if "?" in url and "strona=" not in url:
-            url = url.split('?')[0]
-            
-        if url in seen:
+        
+        # Ignoruj puste lub javascript linki
+        if not url or url.endswith('javascript:;'):
             continue
 
         # 1. KSIĄŻKI I AUDIOBOOKI (Cel główny)
         if any(x in url for x in ["/ksiazka/", "/audiobook/"]):
-            # Ścisła blokada pobocznych podstron danej książki (np. edycja, cytaty)
+            # Oczysc z query params - ksiazki nie potrzebuja paginacji
+            url = url.split('?')[0]
+            
+            # Ścisła blokada pobocznych podstron danej książki
             if any(x in url for x in ["/opinie/", "/wydania/", "/dodaj", "/cytaty", "/podobne"]):
                 continue
                 
             if re.search(r"/(ksiazka|audiobook)/(\d+)/", url):
-                seen.add(url)
-                # Typ 'book' - najwyższy priorytet (10), od razu scrapujemy
-                links.append({"url": url, "type": "book", "priority": 10})
+                if url not in seen:
+                    seen.add(url)
+                    links.append({"url": url, "type": "book", "priority": 10})
                 
-        # 2. WYLĘGARNIE LINKÓW (Katalogi, Autorzy, Wydawnictwa, Kategorie, Cykle, Tagi)
-        elif any(x in url for x in ["/autor/", "/cykl/", "/kategoria/", "/wydawnictwo/", "/tag/"]):
-            # Ścisła blokada śmieci społecznościowych i forów na profilach
-            if any(x in url for x in ["/opinie", "/dyskusje", "/cytaty", "/wiadomosci", "/oceny"]):
-                continue
-                
-            seen.add(url)
-            # Typ 'list' - niższy priorytet (5). Pająk wejdzie tu w wolnej chwili, 
-            # pobierze kod HTML i poszuka w nim nowych linków do książek.
-            links.append({"url": url, "type": "list", "priority": 5})
+        # 2. WYLĘGARNIE LINKÓW (Autorzy, Wydawnictwa, Cykle - stary format z ID)
+        elif any(x in url for x in ["/autor/", "/cykl/", "/wydawnictwo/"]):
+            url = _clean_list_url(url)
             
+            # Ścisła blokada śmieci społecznościowych i forów
+            if any(x in url for x in ["/opinie", "/dyskusje", "/cytaty", "/wiadomosci", "/oceny",
+                                       "/forum/", "/profil/", "/dodaj"]):
+                continue
+            
+            if url not in seen:
+                seen.add(url)
+                links.append({"url": url, "type": "list", "priority": 5})
+
+        # 3. KATEGORIE (nowy format /kategoria/grupa/nazwa)
+        elif "/kategoria/" in url:
+            url = _clean_list_url(url)
+            if url not in seen:
+                seen.add(url)
+                links.append({"url": url, "type": "list", "priority": 5})
+
+        # 4. TAGI (format /ksiazki/t/nazwa-tagu lub /tag/)
+        elif "/ksiazki/t/" in url or "/tag/" in url:
+            url = _clean_list_url(url)
+            if url not in seen:
+                seen.add(url)
+                links.append({"url": url, "type": "list", "priority": 4})
+
+        # 5. STRONY KATALOGOWE Z PAGINACJĄ (nowy format /katalog/...)
+        elif "/katalog/" in url or url.rstrip('/') == "https://lubimyczytac.pl/katalog":
+            url = _clean_list_url(url)
+            if any(x in url for x in ["/dodaj", "/edytuj"]):
+                continue
+            if url not in seen:
+                seen.add(url)
+                links.append({"url": url, "type": "list", "priority": 5})
+        
+        # 6. SEKCJE ZBIORCZE (nowości, zapowiedzi, popularne autorzy, cykle)
+        elif any(x in url for x in ["/ksiazki/nowosci", "/ksiazki/zapowiedzi",
+                                     "/ksiazki/nowosci-i-zapowiedzi",
+                                     "/autorzy", "/cykle",
+                                     "/ksiazki/tagi", "/ksiazki/kategorie",
+                                     "/patronaty"]):
+            url = _clean_list_url(url)
+            if url not in seen:
+                seen.add(url)
+                links.append({"url": url, "type": "list", "priority": 3})
+
+        # 7. STARY FORMAT KATEGORII (/ksiazki/k/ID/nazwa)
+        elif re.search(r"/ksiazki/k/\d+/", url):
+            url = _clean_list_url(url)
+            if url not in seen:
+                seen.add(url)
+                links.append({"url": url, "type": "list", "priority": 5})
+            
+    return links
+
+
+def generate_pagination_urls(base_url: str, max_pages: int = 50) -> List[Dict[str, Any]]:
+    """Generuje URL-e paginacyjne dla danej strony listy.
+    
+    Przydatne gdy strona nie zawiera linków paginacyjnych w HTML
+    (np. katalog główny z JS-ową paginacją), ale serwer obsługuje ?page=N.
+    """
+    links = []
+    # Usun istniejacy parametr page jesli jest
+    clean_url = re.sub(r'[?&]page=\d+', '', base_url).rstrip('?&')
+    separator = '?' if '?' not in clean_url else '&'
+    
+    for page in range(2, max_pages + 1):
+        url = f"{clean_url}{separator}page={page}"
+        links.append({"url": url, "type": "list", "priority": 4})
+    
     return links
