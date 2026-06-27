@@ -2,6 +2,167 @@ import re
 from bs4 import BeautifulSoup
 from loguru import logger
 from typing import Optional, List, Dict, Any
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+
+import config
+
+# Bazowy adres portalu — używany do absolutyzacji linków względnych (zaczynających się od "/")
+BASE_URL = "https://lubimyczytac.pl"
+
+# --- Wzorce rozpoznawania typów linków ---
+# "Wylęgarnie" linków: strony listujące książki (autorzy, cykle, kategorie,
+# wydawnictwa, tagi oraz kategorie po ID). Pająk wchodzi na nie, by znaleźć
+# kolejne książki i kolejne wylęgarnie.
+#   - /autor/<id>/...           -> strona autora
+#   - /cykl/<id>/...            -> strona cyklu
+#   - /kategoria/<dział>/<kat>  -> kategoria (po nazwie)
+#   - /ksiazki/k/<id>/...       -> kategoria (po ID) — występuje m.in. na stronach cykli
+#   - /ksiazki/t/<tag>          -> strona tagu — portal NIE używa już /tag/, tylko /ksiazki/t/
+#   - /wydawnictwo/<id>/...     -> strona wydawnictwa
+LIST_PATTERNS = (
+    "/autor/",
+    "/cykl/",
+    "/kategoria/",
+    "/ksiazki/k/",
+    "/ksiazki/t/",
+    "/wydawnictwo/",
+)
+
+# Podstrony-śmieci, których NIE chcemy dodawać do kolejki (opinie, cytaty,
+# dyskusje, formularze dodawania itp.). Sprawdzane jako fragment URL-a.
+JUNK_PATTERNS = (
+    "/opinie",
+    "/dyskusje",
+    "/cytat",      # pokrywa zarówno /cytat/<id> jak i /cytaty/...
+    "/wiadomosci",
+    "/oceny",
+    "/dodaj",
+    "/wydania",
+    "/podobne",
+    "/fani",       # lista obserwujących wydawnictwo/autora — bezużyteczna dla zbierania książek
+)
+
+
+def _normalize_url(href: str, keep_page: bool = False) -> Optional[str]:
+    """
+    Sprowadza surowy atrybut href do kanonicznej, porównywalnej postaci URL.
+
+    Robi następujące rzeczy:
+      1. Absolutyzuje linki względne ("/ksiazka/..." -> "https://lubimyczytac.pl/ksiazka/...").
+      2. Odrzuca linki spoza domeny lubimyczytac.pl oraz nie-HTTP (mailto:, javascript: itp.).
+      3. Usuwa fragment (#...) i — domyślnie — wszystkie parametry zapytania (?...).
+      4. Gdy keep_page=True, zachowuje WYŁĄCZNIE numeryczny parametr ?page=N
+         (potrzebny dla paginacji list), odrzucając resztę (np. ?sortBy=...).
+      5. Ucina końcowy ukośnik ze ścieżki, by "/foo" i "/foo/" były tym samym adresem.
+
+    Argumenty:
+        href: surowa wartość atrybutu href z tagu <a>.
+        keep_page: czy zachować parametr ?page=N (dla linków do list).
+
+    Zwraca:
+        Znormalizowany, absolutny URL (str) albo None, jeśli link należy odrzucić.
+    """
+    if not href:
+        return None
+
+    href = href.strip()
+
+    # Odrzucamy kotwice i pseudo-linki od razu
+    if href.startswith("#") or href.lower().startswith(("mailto:", "javascript:", "tel:")):
+        return None
+
+    # Absolutyzacja: "//host/..." oraz "/sciezka"
+    if href.startswith("//"):
+        href = "https:" + href
+    elif href.startswith("/"):
+        href = BASE_URL + href
+    elif not href.startswith("http"):
+        # Inny dziwny schemat lub link względny bez wiodącego "/" — pomijamy
+        return None
+
+    parsed = urlparse(href)
+
+    # Tylko HTTP(S) i tylko nasza domena (łapie też subdomeny typu www.)
+    if parsed.scheme not in ("http", "https"):
+        return None
+    if "lubimyczytac.pl" not in parsed.netloc:
+        return None
+
+    # Budowa parametru query — domyślnie pusty (czyścimy ?sortBy, ?phrase itd.)
+    query = ""
+    if keep_page:
+        for key, value in parse_qsl(parsed.query):
+            # Zachowujemy tylko sensowny, dodatni numer strony
+            if key == "page" and value.isdigit() and int(value) > 0:
+                query = urlencode({"page": value})
+                break
+
+    # Normalizacja ścieżki: ucięcie końcowego "/" (ale zostawiamy samotny "/")
+    path = parsed.path.rstrip("/") or "/"
+
+    return urlunparse((parsed.scheme, parsed.netloc, path, "", query, ""))
+
+
+def extract_pagination_links(html: str, base_url: str, max_list_pages: Optional[int] = None) -> List[str]:
+    """
+    Na podstawie widgetu paginacji (atrybut data-maxpage) generuje pełen zestaw
+    adresów kolejnych stron listy w formacie "<bazowy_url>?page=N".
+
+    Dlaczego tak: portal renderuje paginację na dwa sposoby:
+      * Wydawnictwa/kategorie/autorzy: prawdziwe linki <a href="...?page=2"> (GET działa).
+      * Cykle/serie: przyciski JS (href="#") ładowane AJAX-em — brak gotowych linków.
+    W obu przypadkach w HTML jest jednak <input ... data-maxpage="N">, więc
+    odczytujemy maksymalną liczbę stron i sami budujemy adresy ?page=N. Dla list
+    AJAX-owych serwer może zignorować parametr (zwróci stronę 1) — wtedy zadziała
+    deduplikacja (po URL w kolejce i po external_id książek), więc to bezpieczne.
+
+    Argumenty:
+        html: pełny kod HTML analizowanej strony listy.
+        base_url: adres analizowanej strony (źródło) — baza dla budowania ?page=N.
+        max_list_pages: górny limit liczby generowanych stron (ochrona przed
+            ogromnymi kategoriami). None => odczyt z config.MAX_LIST_PAGES.
+            Wartość <= 0 oznacza brak limitu (generujemy wszystkie strony).
+
+    Zwraca:
+        Listę adresów URL (str) kolejnych stron (od strony 2 wzwyż). Pusta lista,
+        jeśli paginacji nie ma lub jest tylko jedna strona.
+    """
+    if not base_url:
+        return []
+
+    soup = BeautifulSoup(html, "lxml")
+
+    # Domyślny limit pobieramy z konfiguracji (0 = bez limitu)
+    if max_list_pages is None:
+        max_list_pages = getattr(config, "MAX_LIST_PAGES", 0)
+
+    # Szukamy dowolnego elementu z atrybutem data-maxpage (input paginatora)
+    maxpage = None
+    pager = soup.select_one("[data-maxpage]")
+    if pager and pager.get("data-maxpage"):
+        try:
+            maxpage = int(pager["data-maxpage"])
+        except (ValueError, TypeError):
+            maxpage = None
+
+    # Brak paginacji albo tylko jedna strona — nie ma czego generować
+    if not maxpage or maxpage < 2:
+        return []
+
+    # Ostatnia strona do wygenerowania (z uwzględnieniem limitu ochronnego)
+    last_page = maxpage
+    if max_list_pages and max_list_pages > 0:
+        last_page = min(maxpage, max_list_pages)
+
+    # Czysta baza adresu — bez query i fragmentu, z uciętym końcowym "/"
+    if not base_url.startswith("http"):
+        base_url = BASE_URL + base_url
+    parsed = urlparse(base_url)
+    path = parsed.path.rstrip("/") or "/"
+    clean_base = urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
+
+    # Generujemy adresy od strony 2 (strona 1 to bieżący, już przetwarzany URL)
+    return [f"{clean_base}?page={n}" for n in range(2, last_page + 1)]
 
 def clean_int(text: Optional[str]) -> Optional[int]:
     if not text:
@@ -200,44 +361,68 @@ def extract_reviews(html: str) -> List[Dict[str, Any]]:
         
     return reviews_data
 
-def extract_links(html: str) -> List[Dict[str, Any]]:
+def extract_links(html: str, base_url: Optional[str] = None, max_list_pages: Optional[int] = None) -> List[Dict[str, Any]]:
+    """
+    Wyciąga z kodu HTML wszystkie wartościowe linki do dalszego crawlowania:
+      * książki/audiobooki  -> typ "book", priorytet 10 (pobierane w pierwszej kolejności),
+      * wylęgarnie list      -> typ "list", priorytet 5 (autorzy, cykle, kategorie,
+                                wydawnictwa, tagi, kategorie po ID),
+      * kolejne strony list  -> typ "list", priorytet 5 (paginacja ?page=N, generowana
+                                z data-maxpage, jeśli podano base_url).
+
+    Argumenty:
+        html: pełny kod HTML analizowanej strony.
+        base_url: adres analizowanej strony. Jeśli podany ORAZ nie jest to strona
+            szczegółów książki, dogeneruje linki paginacji do kolejnych stron listy.
+        max_list_pages: limit liczby stron paginacji do wygenerowania (None => z configu).
+
+    Zwraca:
+        Listę słowników {"url", "type", "priority"} — zdeduplikowaną po URL.
+    """
     soup = BeautifulSoup(html, 'lxml')
-    links = []
+    links: List[Dict[str, Any]] = []
     seen = set()
-    
+
+    def add(url: Optional[str], type_: str, priority: int) -> None:
+        """Dodaje link do wyniku, pilnując deduplikacji po znormalizowanym URL."""
+        if url and url not in seen:
+            seen.add(url)
+            links.append({"url": url, "type": type_, "priority": priority})
+
     for a in soup.find_all('a', href=True):
-        href = a['href']
-        if href.startswith('/'):
-            href = "https://lubimyczytac.pl" + href
-            
-        # Oczyszczanie linku z kotwic (#) oraz parametrów sortowania (?)
-        url = href.split('#')[0]
-        if "?" in url and "strona=" not in url:
-            url = url.split('?')[0]
-            
-        if url in seen:
+        raw = a['href']
+
+        # 1. KSIĄŻKI I AUDIOBOOKI (cel główny) — najwyższy priorytet
+        if "/ksiazka/" in raw or "/audiobook/" in raw:
+            url = _normalize_url(raw)  # czyścimy też ?... -> kanoniczny adres książki
+            if not url:
+                continue
+            # Blokada pobocznych podstron książki (opinie, cytaty, wydania, podobne...)
+            if any(j in url for j in JUNK_PATTERNS):
+                continue
+            # Musi to być właściwy adres szczegółów: /ksiazka/<id>/ lub /audiobook/<id>/
+            if re.search(r"/(ksiazka|audiobook)/\d+/", url):
+                add(url, "book", 10)
             continue
 
-        # 1. KSIĄŻKI I AUDIOBOOKI (Cel główny)
-        if any(x in url for x in ["/ksiazka/", "/audiobook/"]):
-            # Ścisła blokada pobocznych podstron danej książki (np. edycja, cytaty)
-            if any(x in url for x in ["/opinie/", "/wydania/", "/dodaj", "/cytaty", "/podobne"]):
+        # 2. WYLĘGARNIE LINKÓW (listy) — autorzy, cykle, kategorie, wydawnictwa, tagi
+        if any(p in raw for p in LIST_PATTERNS):
+            # Blokada śmieci (opinie, dyskusje, cytaty, listy fanów itp.)
+            if any(j in raw for j in JUNK_PATTERNS):
                 continue
-                
-            if re.search(r"/(ksiazka|audiobook)/(\d+)/", url):
-                seen.add(url)
-                # Typ 'book' - najwyższy priorytet (10), od razu scrapujemy
-                links.append({"url": url, "type": "book", "priority": 10})
-                
-        # 2. WYLĘGARNIE LINKÓW (Katalogi, Autorzy, Wydawnictwa, Kategorie, Cykle, Tagi)
-        elif any(x in url for x in ["/autor/", "/cykl/", "/kategoria/", "/wydawnictwo/", "/tag/"]):
-            # Ścisła blokada śmieci społecznościowych i forów na profilach
-            if any(x in url for x in ["/opinie", "/dyskusje", "/cytaty", "/wiadomosci", "/oceny"]):
-                continue
-                
-            seen.add(url)
-            # Typ 'list' - niższy priorytet (5). Pająk wejdzie tu w wolnej chwili, 
-            # pobierze kod HTML i poszuka w nim nowych linków do książek.
-            links.append({"url": url, "type": "list", "priority": 5})
-            
+            # keep_page=True: zachowujemy ?page=N z gotowych linków paginacji
+            url = _normalize_url(raw, keep_page=True)
+            add(url, "list", 5)
+            continue
+
+    # 3. PAGINACJA — dogenerowanie pełnego zakresu stron listy.
+    # Robimy to tylko dla stron-list (nie dla szczegółów książki), aby nie tworzyć
+    # sztucznych adresów ?page=N na stronach pojedynczych książek.
+    if base_url and not re.search(r"/(ksiazka|audiobook)/\d+/", base_url):
+        # Nie regenerujemy paginacji ze stron, które same są już stroną N (?page=...),
+        # żeby nie powielać tej samej roboty z każdej kolejnej strony.
+        if "page=" not in urlparse(base_url).query:
+            for page_url in extract_pagination_links(html, base_url, max_list_pages):
+                add(page_url, "list", 5)
+
     return links
