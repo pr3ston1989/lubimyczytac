@@ -55,10 +55,11 @@ def run_interactive_menu(scraper: Scraper):
         print(" 8. 🛠️ Reset bazy        (Inicjalizacja nowej bazy)")
         print(" 9. 🎯 Skaner ID (🚀)   (Wielowatkowy skan w GORE lub w DOL)")
         print(" 10.🕷️ Tryb Pajak (Crawl)(Przechodz po linkach stron portalu)")
+        print(" 11.📦 Zbierz z cache   (Wyciagnij linki z zapisanych stron)")
         print(" 0. ❌ Wyjscie")
         print("="*55)
 
-        choice = input("Wybierz opcje (0-10): ").strip()
+        choice = input("Wybierz opcje (0-11): ").strip()
 
         try:
             if choice == '1':
@@ -130,6 +131,22 @@ def run_interactive_menu(scraper: Scraper):
                     scraper.seed_start_urls()
                     
                 scraper.run_queue()
+            elif choice == '11':
+                print("\n[📦] Tryb zbierania linkow z cache.")
+                print("    Przeszukam zapisane pliki HTML i wyciagne z nich linki do kolejki.")
+                
+                scraper.mode = "spider"
+                new_links_count = scraper.harvest_links_from_cache()
+                
+                if new_links_count > 0:
+                    run_now = input(f"\nZnaleziono {new_links_count} nowych linkow. Uruchomic pajaka? (t/n): ").strip().lower()
+                    if run_now == 't':
+                        workers_input = input("Podaj liczbe watkow (domyslnie 5): ").strip()
+                        workers = int(workers_input) if workers_input.isdigit() and int(workers_input) > 0 else 5
+                        scraper.max_workers = workers
+                        scraper.run_queue()
+                else:
+                    print("[i] Nie znaleziono nowych linkow w cache. Kolejka nie zostala zmieniona.")
             elif choice == '0':
                 print("Do zobaczenia!")
                 break
@@ -145,7 +162,7 @@ def run_interactive_menu(scraper: Scraper):
 def main():
     parser = argparse.ArgumentParser(description="LubimyCzytac CLI Scraper")
     parser.add_argument("command", nargs="?", choices=[
-        "init-db", "full-scan", "scrape-url", "update-new", "resume", "stats", "daemon-ids", "fill-gaps", "id-range-scan", "spider"
+        "init-db", "full-scan", "scrape-url", "update-new", "resume", "stats", "daemon-ids", "fill-gaps", "id-range-scan", "spider", "harvest-cache"
     ], help="Komenda do wykonania (zostaw puste, by otworzyc menu)")
     parser.add_argument("--url", help="URL do pobrania dla trybu scrape-url")
     
@@ -183,6 +200,13 @@ def main():
             scraper.run_custom_id_scanner(start_id=1, direction="up", count=20000)
         elif args.command == "spider":
             scraper.run_queue()
+        elif args.command == "harvest-cache":
+            scraper.mode = "spider"
+            new_links = scraper.harvest_links_from_cache()
+            if new_links > 0:
+                print(f"Dodano {new_links} nowych linkow do kolejki. Uruchom 'resume' lub 'spider' by je przetworzyc.")
+            else:
+                print("Nie znaleziono nowych linkow w cache.")
         elif args.command == "stats":
             show_stats()
 

@@ -11,7 +11,7 @@ import config
 from database import get_session
 from sqlalchemy import func
 from models import Book, Author, Publisher, Series, Category, Cover, Review, ScrapeQueue
-from parser import extract_book_info, extract_links, extract_reviews, generate_pagination_urls
+from parser import extract_book_info, extract_links, extract_reviews
 from downloader import download_cover
 from progress import add_to_queue, get_next_in_queue, mark_queue_status, mark_queue_failed, log_error, add_many_to_queue, get_batch_queue, mark_status
 
@@ -193,21 +193,10 @@ class Scraper:
                     final_url = str(res.url) if hasattr(res, 'url') and res.url else url
                     self.process_book_page(final_url, res.text, db_session)
                     if self.mode == "spider":
-                        discovered_links = extract_links(res.text)
+                        discovered_links = extract_links(res.text, base_url=final_url)
                         self.enqueue_spider_links(discovered_links, db_session)
                 elif item_dict["type"] == "list":
-                    discovered_links = extract_links(res.text)
-                    
-                    # Jesli strona paginacyjna nie zawiera zadnych linkow do ksiazek,
-                    # oznacza to koniec paginacji - nie generuj wiecej stron.
-                    has_book_links = any(link["type"] == "book" for link in discovered_links)
-                    
-                    # Proaktywna paginacja: jesli to pierwsza strona listy (bez ?page=),
-                    # generuj linki do kolejnych stron, bo paginacja moze byc JS-owa.
-                    if "page=" not in url and has_book_links:
-                        pagination_links = generate_pagination_urls(url, max_pages=50)
-                        discovered_links.extend(pagination_links)
-                    
+                    discovered_links = extract_links(res.text, base_url=url)
                     self.enqueue_spider_links(discovered_links, db_session)
             mark_status(item_id, "completed")
             return f"Zapisano: {url.split('/')[-1][:30]}"
@@ -263,6 +252,7 @@ class Scraper:
             # Popularne autorzy i cykle
             "https://lubimyczytac.pl/autorzy",
             "https://lubimyczytac.pl/cykle",
+            "https://lubimyczytac.pl/serie",
             # Tagi - glowna strona z lista tagow
             "https://lubimyczytac.pl/ksiazki/tagi",
             # Strony zbiorcze z linkami do ksiazek
@@ -457,6 +447,101 @@ class Scraper:
                         future.cancel()
                     executor.shutdown(wait=False, cancel_futures=True)
                     raise
+
+    def harvest_links_from_cache(self):
+        """
+        Przeszukuje zapisane pliki HTML w katalogu cache (data/html_cache/)
+        i wyciaga z nich linki do ksiazek/audiobookow oraz stron katalogowych.
+        Nowe linki sa dodawane do kolejki scrape'owania (ScrapeQueue).
+        
+        Zwraca:
+            int: Laczna liczba nowych linkow dodanych do kolejki.
+        """
+        logger.info("[Cache Harvester] Rozpoczynam ekstrakcje linkow z plikow cache...")
+
+        if not os.path.isdir(CACHE_DIR):
+            logger.warning(f"Katalog cache '{CACHE_DIR}' nie istnieje.")
+            return 0
+
+        cache_files = [f for f in os.listdir(CACHE_DIR) if f.endswith(".html")]
+        total_files = len(cache_files)
+
+        if total_files == 0:
+            logger.info("[Cache Harvester] Katalog cache jest pusty.")
+            return 0
+
+        logger.info(f"[Cache Harvester] Znaleziono {total_files} plikow HTML do przeanalizowania.")
+
+        all_discovered_links = []
+        seen_urls = set()
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold green]Cache Harvester:[/bold green] {task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TextColumn("[cyan]Pozostalo: {task.remaining}"),
+        ) as progress:
+            task = progress.add_task("Analizowanie plikow cache...", total=total_files)
+
+            for filename in cache_files:
+                filepath = os.path.join(CACHE_DIR, filename)
+                try:
+                    with open(filepath, "r", encoding="utf-8") as f:
+                        html_content = f.read()
+
+                    links_data = extract_links(html_content)
+
+                    for link in links_data:
+                        url = link["url"]
+                        if url not in seen_urls:
+                            seen_urls.add(url)
+                            all_discovered_links.append(link)
+
+                except Exception as e:
+                    logger.warning(f"Blad przy odczycie pliku cache '{filename}': {e}")
+
+                progress.update(task, advance=1, description=f"Przetworzono: {filename[:35]}")
+
+        logger.info(f"[Cache Harvester] Wyekstrahowano {len(all_discovered_links)} unikalnych linkow z cache.")
+
+        total_new_links = 0
+        if all_discovered_links:
+            with get_session() as db_session:
+                # Batch query: zbierz wszystkie external_id do sprawdzenia
+                book_ext_ids = {}
+                for link in all_discovered_links:
+                    if link["type"] == "book":
+                        match = re.search(r"/(ksiazka|audiobook)/(\d+)/", link["url"])
+                        if match:
+                            book_ext_ids[int(match.group(2))] = link
+
+                # Jedno zapytanie zamiast N
+                existing_ids = set()
+                if book_ext_ids:
+                    existing_ids = set(
+                        r[0] for r in db_session.query(Book.external_id)
+                        .filter(Book.external_id.in_(list(book_ext_ids.keys())))
+                        .all()
+                    )
+
+                filtered_links = []
+                for link in all_discovered_links:
+                    if link["type"] == "book":
+                        match = re.search(r"/(ksiazka|audiobook)/(\d+)/", link["url"])
+                        if match and int(match.group(2)) in existing_ids:
+                            continue
+                    filtered_links.append(link)
+
+                total_new_links = len(filtered_links)
+                if filtered_links:
+                    add_many_to_queue(filtered_links)
+                    logger.info(f"[Cache Harvester] Dodano {total_new_links} nowych linkow do kolejki.")
+                else:
+                    logger.info("[Cache Harvester] Wszystkie znalezione linki juz istnieja w bazie lub kolejce.")
+
+        logger.info(f"[Cache Harvester] Zakończono. Nowe linki w kolejce: {total_new_links}")
+        return total_new_links
 
     def run_custom_id_scanner(self, start_id: int, direction: str = "up", count: int = 20000):
         logger.info(f"[!] Uruchamiam wielowatkowy skaner ID. Start: {start_id}, Kierunek: {direction}, Ilosc: {count}")
