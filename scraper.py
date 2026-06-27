@@ -152,10 +152,12 @@ class Scraper:
                 if item_dict["type"] == "book":
                     self.process_book_page(url, res.text, db_session)
                     if self.mode == "spider":
-                        discovered_links = extract_links(res.text)
+                        # base_url=url pozwala m.in. wygenerować paginację, jeśli strona ją ma
+                        discovered_links = extract_links(res.text, base_url=url)
                         self.enqueue_spider_links(discovered_links, db_session)
                 elif item_dict["type"] == "list":
-                    discovered_links = extract_links(res.text)
+                    # Dla stron-list przekazujemy base_url => zbieramy też kolejne strony (?page=N)
+                    discovered_links = extract_links(res.text, base_url=url)
                     self.enqueue_spider_links(discovered_links, db_session)
             mark_status(item_id, "completed")
             return f"Zapisano: {url.split('/')[-1][:30]}"
@@ -193,7 +195,20 @@ class Scraper:
                             progress.update(task, description=status_msg, completed=processed_count, total=processed_count + new_pending)
 
     def seed_start_urls(self):
-        starts = ["https://lubimyczytac.pl/katalog", "https://lubimyczytac.pl/ksiazki/nowosci"]
+        # Punkty startowe pająka. Oprócz katalogu i nowości dodajemy strony-indeksy
+        # wylęgarni (wydawnictwa, autorzy, kategorie, cykle, serie). Każdy z tych
+        # indeksów linkuje do pojedynczych wylęgarni (/wydawnictwo/, /autor/,
+        # /kategoria/, /cykl/...), a dzięki paginacji (?page=N) pająk dotrze do
+        # wszystkich ich podstron — co maksymalizuje szansę zebrania wszystkich książek.
+        starts = [
+            "https://lubimyczytac.pl/katalog",
+            "https://lubimyczytac.pl/ksiazki/nowosci",
+            "https://lubimyczytac.pl/wydawnictwa",
+            "https://lubimyczytac.pl/autorzy",
+            "https://lubimyczytac.pl/ksiazki/kategorie",
+            "https://lubimyczytac.pl/cykle",
+            "https://lubimyczytac.pl/serie",
+        ]
         with get_session() as session:
             for url in starts:
                 existing = session.query(ScrapeQueue).filter_by(url=url).first()

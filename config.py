@@ -9,6 +9,12 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 MIN_DELAY = float(os.getenv("MIN_DELAY", 1.0))
 MAX_DELAY = float(os.getenv("MAX_DELAY", 3.0))
 
+# Maksymalna liczba stron paginacji generowanych z jednej listy (wydawnictwo,
+# kategoria, autor, tag itd.). Chroni przed wygenerowaniem dziesiątek tysięcy
+# adresów z bardzo dużych kategorii. Wartość 0 = brak limitu (generuj wszystkie
+# strony aż do data-maxpage). Można nadpisać zmienną środowiskową MAX_LIST_PAGES.
+MAX_LIST_PAGES = int(os.getenv("MAX_LIST_PAGES", 0))
+
 # Rotujące User-Agenty
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
