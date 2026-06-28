@@ -140,30 +140,33 @@ class Scraper:
         if not links_data:
             return
         
-        # Zbierz wszystkie external_id ksiazek do sprawdzenia w jednym zapytaniu
+        # Zbierz wszystkie external_id ksiazek do sprawdzenia
         book_ids_to_check = {}
+        non_book_links = []
         for item in links_data:
             match = re.search(r"/(ksiazka|audiobook)/(\d+)/", item["url"])
             if match:
                 book_ids_to_check[int(match.group(2))] = item
+            else:
+                non_book_links.append(item)
         
-        # Jedno zapytanie zamiast N
+        # Batch query z chunkowaniem (SQLite limit ~999 parametrow)
         existing_ids = set()
         if book_ids_to_check:
-            existing_ids = set(
-                r[0] for r in db_session.query(Book.external_id)
-                .filter(Book.external_id.in_(list(book_ids_to_check.keys())))
-                .all()
-            )
+            ids_list = list(book_ids_to_check.keys())
+            CHUNK_SIZE = 500
+            for i in range(0, len(ids_list), CHUNK_SIZE):
+                chunk = ids_list[i:i + CHUNK_SIZE]
+                existing_ids.update(
+                    r[0] for r in db_session.query(Book.external_id)
+                    .filter(Book.external_id.in_(chunk))
+                    .all()
+                )
         
-        valid_links = []
-        for item in links_data:
-            match = re.search(r"/(ksiazka|audiobook)/(\d+)/", item["url"])
-            if match:
-                ext_id = int(match.group(2))
-                if ext_id in existing_ids:
-                    continue
-            valid_links.append(item)
+        valid_links = list(non_book_links)
+        for ext_id, item in book_ids_to_check.items():
+            if ext_id not in existing_ids:
+                valid_links.append(item)
         
         if valid_links:
             add_many_to_queue(valid_links)
@@ -516,14 +519,18 @@ class Scraper:
                         if match:
                             book_ext_ids[int(match.group(2))] = link
 
-                # Jedno zapytanie zamiast N
+                # Batch query z chunkowaniem (SQLite limit ~999 parametrow)
                 existing_ids = set()
                 if book_ext_ids:
-                    existing_ids = set(
-                        r[0] for r in db_session.query(Book.external_id)
-                        .filter(Book.external_id.in_(list(book_ext_ids.keys())))
-                        .all()
-                    )
+                    ids_list = list(book_ext_ids.keys())
+                    CHUNK_SIZE = 500
+                    for i in range(0, len(ids_list), CHUNK_SIZE):
+                        chunk = ids_list[i:i + CHUNK_SIZE]
+                        existing_ids.update(
+                            r[0] for r in db_session.query(Book.external_id)
+                            .filter(Book.external_id.in_(chunk))
+                            .all()
+                        )
 
                 filtered_links = []
                 for link in all_discovered_links:
