@@ -5,7 +5,7 @@ import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from curl_cffi import requests as cureq
 from loguru import logger
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn, MofNCompleteColumn
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn, MofNCompleteColumn, SpeedColumn
 
 import threading
 
@@ -293,10 +293,11 @@ class Scraper:
             TextColumn("[cyan]|"),
             TaskProgressColumn(),
             TextColumn("[cyan]|"),
+            SpeedColumn(),
+            TextColumn("[cyan]|"),
             TimeElapsedColumn(),
             TextColumn("[cyan]→"),
             TimeRemainingColumn(),
-            TextColumn("[cyan]| {task.speed:.1f} it/s" if "{task.speed}" != "None" else ""),
         ) as progress:
             task = progress.add_task(
                 f"[{self.max_workers}T] Delay {config.MIN_DELAY}-{config.MAX_DELAY}s",
