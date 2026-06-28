@@ -5,7 +5,7 @@ import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from curl_cffi import requests as cureq
 from loguru import logger
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn, MofNCompleteColumn, SpeedColumn
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn, MofNCompleteColumn
 
 import threading
 
@@ -292,8 +292,6 @@ class Scraper:
             MofNCompleteColumn(),
             TextColumn("[cyan]|"),
             TaskProgressColumn(),
-            TextColumn("[cyan]|"),
-            SpeedColumn(),
             TextColumn("[cyan]|"),
             TimeElapsedColumn(),
             TextColumn("[cyan]→"),
