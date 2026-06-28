@@ -57,10 +57,11 @@ def run_interactive_menu(scraper: Scraper):
         print(" 9. 🎯 Skaner ID (🚀)   (Wielowatkowy skan w GORE lub w DOL)")
         print(" 10.🕷️ Tryb Pajak (Crawl)(Przechodz po linkach stron portalu)")
         print(" 11.📦 Zbierz z cache   (Wyciagnij linki z zapisanych stron)")
+        print(" 12.🔄 Aktualizacja     (Pobierz nowosci + nowe ID)")
         print(" 0. ❌ Wyjscie")
         print("="*55)
 
-        choice = input("Wybierz opcje (0-11): ").strip()
+        choice = input("Wybierz opcje (0-12): ").strip()
 
         try:
             if choice == '1':
@@ -167,6 +168,25 @@ def run_interactive_menu(scraper: Scraper):
                         scraper.run_queue()
                 else:
                     print("[i] Nie znaleziono nowych linkow w cache. Kolejka nie zostala zmieniona.")
+            elif choice == '12':
+                workers_input = input("Podaj liczbe watkow (domyslnie 5): ").strip()
+                workers = int(workers_input) if workers_input.isdigit() and int(workers_input) > 0 else 5
+                
+                lookahead_input = input("Ile nowych ID sprawdzic ponad max (domyslnie 2000): ").strip()
+                lookahead = int(lookahead_input) if lookahead_input.isdigit() and int(lookahead_input) > 0 else 2000
+                
+                delay_input = input(f"Delay min,max w sek (obecny: {config.MIN_DELAY},{config.MAX_DELAY}; Enter=bez zmian): ").strip()
+                if delay_input:
+                    parts = delay_input.split(',')
+                    if len(parts) == 2:
+                        config.MIN_DELAY = float(parts[0])
+                        config.MAX_DELAY = float(parts[1])
+                    elif len(parts) == 1:
+                        config.MIN_DELAY = float(parts[0])
+                        config.MAX_DELAY = float(parts[0])
+                
+                scraper.max_workers = workers
+                scraper.run_update(id_lookahead=lookahead)
             elif choice == '0':
                 print("Do zobaczenia!")
                 break
@@ -182,7 +202,7 @@ def run_interactive_menu(scraper: Scraper):
 def main():
     parser = argparse.ArgumentParser(description="LubimyCzytac CLI Scraper")
     parser.add_argument("command", nargs="?", choices=[
-        "init-db", "full-scan", "scrape-url", "update-new", "resume", "stats", "daemon-ids", "fill-gaps", "id-range-scan", "spider", "harvest-cache"
+        "init-db", "full-scan", "scrape-url", "update-new", "resume", "stats", "daemon-ids", "fill-gaps", "id-range-scan", "spider", "harvest-cache", "update"
     ], help="Komenda do wykonania (zostaw puste, by otworzyc menu)")
     parser.add_argument("--url", help="URL do pobrania dla trybu scrape-url")
     parser.add_argument("--workers", "-w", type=int, default=5, help="Liczba watkow (domyslnie 5)")
@@ -239,6 +259,8 @@ def main():
                 print(f"Dodano {new_links} nowych linkow do kolejki. Uruchom 'resume' lub 'spider' by je przetworzyc.")
             else:
                 print("Nie znaleziono nowych linkow w cache.")
+        elif args.command == "update":
+            scraper.run_update()
         elif args.command == "stats":
             show_stats()
 

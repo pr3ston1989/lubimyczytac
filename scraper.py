@@ -7,6 +7,8 @@ from curl_cffi import requests as cureq
 from loguru import logger
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn, MofNCompleteColumn
 
+import threading
+
 import config
 from database import get_session
 from sqlalchemy import func
@@ -23,6 +25,11 @@ class Scraper:
         self.mode = mode
         self.max_workers = max_workers
         self.session = cureq.Session(impersonate="chrome120")
+        # Adaptive throttle - wspoldzielony miedzy watkami
+        self._throttle_lock = threading.Lock()
+        self._delay_multiplier = 1.0  # mnoznik opoznienia (rosnie przy bledach)
+        self._consecutive_errors = 0
+        self._consecutive_ok = 0
 
     def fetch(self, url: str) -> str:
         delay = random.uniform(config.MIN_DELAY, config.MAX_DELAY)
@@ -180,22 +187,63 @@ class Scraper:
         if valid_links:
             add_many_to_queue(valid_links)
 
+    def _throttle_success(self):
+        """Zglos sukces - stopniowo zmniejszaj delay jesli bylo dobrze."""
+        with self._throttle_lock:
+            self._consecutive_errors = 0
+            self._consecutive_ok += 1
+            # Po 20 sukcesach pod rzad, zmniejsz mnoznik (min 1.0)
+            if self._consecutive_ok >= 20 and self._delay_multiplier > 1.0:
+                self._delay_multiplier = max(1.0, self._delay_multiplier * 0.8)
+                self._consecutive_ok = 0
+                logger.debug(f"Throttle DOWN: multiplier={self._delay_multiplier:.2f}")
+
+    def _throttle_error(self, is_rate_limit: bool = False):
+        """Zglos blad - zwieksz delay."""
+        with self._throttle_lock:
+            self._consecutive_ok = 0
+            self._consecutive_errors += 1
+            if is_rate_limit:
+                # 429/503 - agresywne zwolnienie
+                self._delay_multiplier = min(10.0, self._delay_multiplier * 2.0)
+                logger.warning(f"Throttle UP (rate limit): multiplier={self._delay_multiplier:.2f}")
+            elif self._consecutive_errors >= 3:
+                # 3+ bledy pod rzad - lagodne zwolnienie
+                self._delay_multiplier = min(5.0, self._delay_multiplier * 1.5)
+                logger.warning(f"Throttle UP (errors): multiplier={self._delay_multiplier:.2f}")
+
+    def _get_delay(self) -> float:
+        """Oblicz aktualny delay z uwzglednieniem mnoznika."""
+        base_delay = random.uniform(config.MIN_DELAY, config.MAX_DELAY)
+        return base_delay * self._delay_multiplier
+
     def process_single_item(self, item_dict):
         item_id = item_dict["id"]
         url = item_dict["url"]
         try:
-            delay = random.uniform(config.MIN_DELAY, config.MAX_DELAY)
+            delay = self._get_delay()
             time.sleep(delay)
             # Kazdy watek tworzy wlasna sesje HTTP (curl_cffi nie jest thread-safe)
             with cureq.Session(impersonate="chrome120") as local_session:
                 res = local_session.get(url, timeout=15, allow_redirects=True)
+            
+            # Rate limiting detection
+            if res.status_code in (429, 503):
+                self._throttle_error(is_rate_limit=True)
+                # Czekaj i ponow
+                time.sleep(30 * self._delay_multiplier)
+                mark_queue_failed(item_id)
+                return f"Rate limit {res.status_code}: {url.split('/')[-1][:20]}"
+            
             if res.status_code == 404:
+                self._throttle_success()
                 mark_status(item_id, "archived_error")
                 return f"Pudlo 404: {url.split('/')[-1]}"
             # Dla stron paginacyjnych: jesli serwer przekierowal na inna strone
             # (np. /katalog bez ?page=), to oznacza koniec paginacji
             final_url_str = str(res.url) if hasattr(res, 'url') and res.url else url
             if item_dict["type"] == "list" and "page=" in url and "page=" not in final_url_str:
+                self._throttle_success()
                 mark_status(item_id, "archived_error")
                 return f"Koniec paginacji: {url.split('/')[-1]}"
             res.raise_for_status()
@@ -210,10 +258,17 @@ class Scraper:
                 elif item_dict["type"] == "list":
                     discovered_links = extract_links(res.text, base_url=url)
                     self.enqueue_spider_links(discovered_links, db_session)
+            self._throttle_success()
             mark_status(item_id, "completed")
             return f"Zapisano: {url.split('/')[-1][:30]}"
         except Exception as e:
-            logger.error(f"Blad dla {url}: {e}")
+            err_str = str(e).lower()
+            is_network = any(x in err_str for x in ['timeout', 'connection', 'reset', 'refused', 'ssl', '429', '503'])
+            self._throttle_error(is_rate_limit=('429' in err_str or '503' in err_str))
+            if is_network:
+                logger.warning(f"Blad sieci dla {url.split('/')[-1][:25]}: {str(e)[:60]} (retry, delay x{self._delay_multiplier:.1f})")
+            else:
+                logger.error(f"Blad dla {url}: {e}")
             mark_queue_failed(item_id)
             return f"Blad: {url.split('/')[-1][:20]}"
 
@@ -260,6 +315,73 @@ class Scraper:
                         with get_session() as session:
                             new_pending = session.query(ScrapeQueue).filter_by(status='pending').count()
                             progress.update(task, completed=processed_count, total=processed_count + new_pending)
+
+    def run_update(self, id_lookahead: int = 2000):
+        """
+        Tryb aktualizacji - szybkie przechwycenie nowosci bez pelnego crawla.
+        
+        Strategia:
+        1. Scrapuj strony nowosci/zapowiedzi (kilka stron paginacji)
+        2. Sprawdz ID powyżej max known ID (szukaj nowych wpisow)
+        3. Przetworz znalezione linki z kolejki
+        
+        Idealny do codziennego/tygodniowego crona.
+        """
+        logger.info(f"[Update] Rozpoczynam aktualizacje bazy o nowosci...")
+        
+        # 1. Dodaj strony nowosci do kolejki
+        update_seeds = [
+            "https://lubimyczytac.pl/ksiazki/nowosci",
+            "https://lubimyczytac.pl/ksiazki/zapowiedzi",
+            "https://lubimyczytac.pl/katalog/ostatnio-wydane",
+            "https://lubimyczytac.pl/ksiazki/nowosci-i-zapowiedzi",
+        ]
+        with get_session() as session:
+            for url in update_seeds:
+                existing = session.query(ScrapeQueue).filter_by(url=url).first()
+                if existing:
+                    existing.status = "pending"
+                else:
+                    session.add(ScrapeQueue(url=url, type="list", priority=10))
+            session.commit()
+        
+        # 2. Sprawdz nowe ID powyżej max known
+        with get_session() as session:
+            max_id = session.query(func.max(Book.external_id)).scalar() or 0
+            existing_books = set(r[0] for r in session.query(Book.external_id).filter(
+                Book.external_id >= max_id - 100  # ostatnie 100 tez sprawdz (mogly byc puste)
+            ).all())
+            dead_urls = session.query(ScrapeQueue.url).filter(
+                ScrapeQueue.status == 'archived_error'
+            ).all()
+            dead_ids = set()
+            for url_tuple in dead_urls:
+                match = re.search(r"/ksiazka/(\d+)/", url_tuple[0])
+                if match:
+                    dead_ids.add(int(match.group(1)))
+        
+        # Generuj ID do sprawdzenia: od (max_id - 100) do (max_id + lookahead)
+        start_id = max(1, max_id - 100)
+        end_id = max_id + id_lookahead
+        ids_to_check = [
+            cid for cid in range(start_id, end_id + 1)
+            if cid not in existing_books and cid not in dead_ids
+        ]
+        
+        if ids_to_check:
+            logger.info(f"[Update] Dodaje {len(ids_to_check)} ID do sprawdzenia ({start_id}-{end_id})...")
+            id_links = [
+                {"url": f"https://lubimyczytac.pl/ksiazka/{cid}/a", "type": "book", "priority": 8}
+                for cid in ids_to_check
+            ]
+            add_many_to_queue(id_links)
+        
+        # 3. Uruchom kolejke
+        self.mode = "spider"
+        logger.info("[Update] Uruchamiam przetwarzanie kolejki...")
+        self.run_queue()
+        
+        logger.info("[Update] Aktualizacja zakonczona.")
 
     def seed_start_urls(self):
         starts = [
