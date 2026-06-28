@@ -47,15 +47,24 @@ class Scraper:
 
         book = db_session.query(Book).filter_by(external_id=data['external_id']).first()
         if not book:
-            book = Book(
-                external_id=data['external_id'], slug=data['slug'], url=data['url'], type=data['type'],
-                title=data['title'], original_title=data['original_title'], description=data['description'],
-                avg_rating=data['avg_rating'], pages=data['pages'], duration_minutes=data.get('duration_minutes'),
-                release_date=data['release_date'], premiere_date=data['premiere_date'], isbn=data['isbn'], 
-                translator=data['translator'], format=data['format'], volume_number=data.get('volume_number')
-            )
-            db_session.add(book)
-            db_session.flush()
+            try:
+                book = Book(
+                    external_id=data['external_id'], slug=data['slug'], url=data['url'], type=data['type'],
+                    title=data['title'], original_title=data['original_title'], description=data['description'],
+                    avg_rating=data['avg_rating'], pages=data['pages'], duration_minutes=data.get('duration_minutes'),
+                    release_date=data['release_date'], premiere_date=data['premiere_date'], isbn=data['isbn'], 
+                    translator=data['translator'], format=data['format'], volume_number=data.get('volume_number')
+                )
+                db_session.add(book)
+                db_session.flush()
+            except Exception as e:
+                if "UNIQUE constraint" in str(e) or "IntegrityError" in str(e):
+                    db_session.rollback()
+                    book = db_session.query(Book).filter_by(external_id=data['external_id']).first()
+                    if not book:
+                        raise
+                else:
+                    raise
         else:
             # Aktualizacja istniejacego rekordu - uzupelniaj brakujace pola, aktualizuj rating
             if data['avg_rating'] is not None:
