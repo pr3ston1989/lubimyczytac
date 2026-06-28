@@ -5,19 +5,21 @@ from loguru import logger
 from sqlalchemy.dialects.sqlite import insert
 
 def add_many_to_queue(links_data: List[Dict[str, Any]]):
-    """Masowo dodaje linki do kolejki wykonujac tylko JEDEN zapis na dysk."""
+    """Masowo dodaje linki do kolejki w partiach (bezpieczne dla duzych zbiorow)."""
     if not links_data:
         return
 
+    CHUNK_SIZE = 500  # 500 wierszy * 3 kolumny = 1500 parametrow (daleko od limitu SQLite)
+    
     with get_session() as session:
-        # Przygotowanie slownikow do zapisu
-        values = [{"url": d["url"], "type": d["type"], "priority": d["priority"]} for d in links_data]
-        
-        # Specjalne polecenie SQLite: INSERT ... ON CONFLICT DO NOTHING
-        stmt = insert(ScrapeQueue).values(values)
-        stmt = stmt.on_conflict_do_nothing(index_elements=['url'])
-        
-        session.execute(stmt)
+        for i in range(0, len(links_data), CHUNK_SIZE):
+            chunk = links_data[i:i + CHUNK_SIZE]
+            values = [{"url": d["url"], "type": d["type"], "priority": d["priority"]} for d in chunk]
+            
+            stmt = insert(ScrapeQueue).values(values)
+            stmt = stmt.on_conflict_do_nothing(index_elements=['url'])
+            
+            session.execute(stmt)
         session.commit()
 
 def add_to_queue(url: str, type_str: str, priority: int = 0):
