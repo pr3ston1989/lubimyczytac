@@ -4,6 +4,7 @@ from loguru import logger
 from rich.console import Console
 from rich.table import Table
 
+import config
 from database import init_db, get_session
 from scraper import Scraper
 from progress import add_to_queue
@@ -68,6 +69,15 @@ def run_interactive_menu(scraper: Scraper):
                 scraper.seed_start_urls()
                 scraper.run_queue()
             elif choice == '2':
+                delay_input = input(f"Delay min,max w sek (obecny: {config.MIN_DELAY},{config.MAX_DELAY}; Enter=bez zmian): ").strip()
+                if delay_input:
+                    parts = delay_input.split(',')
+                    if len(parts) == 2:
+                        config.MIN_DELAY = float(parts[0])
+                        config.MAX_DELAY = float(parts[1])
+                    elif len(parts) == 1:
+                        config.MIN_DELAY = float(parts[0])
+                        config.MAX_DELAY = float(parts[0])
                 scraper.mode = "resume"
                 scraper.run_queue()
             elif choice == '3':
@@ -120,6 +130,16 @@ def run_interactive_menu(scraper: Scraper):
                 workers_input = input("Podaj liczbe watkow dla pajaka (domyslnie 5): ").strip()
                 workers = int(workers_input) if workers_input.isdigit() and int(workers_input) > 0 else 5
                 
+                delay_input = input(f"Delay min,max w sek (obecny: {config.MIN_DELAY},{config.MAX_DELAY}; Enter=bez zmian): ").strip()
+                if delay_input:
+                    parts = delay_input.split(',')
+                    if len(parts) == 2:
+                        config.MIN_DELAY = float(parts[0])
+                        config.MAX_DELAY = float(parts[1])
+                    elif len(parts) == 1:
+                        config.MIN_DELAY = float(parts[0])
+                        config.MAX_DELAY = float(parts[0])
+                
                 print("\n[!] Tryb Pajaka analizuje linki i dopisuje nowe do kolejki, porownujac je po czystym ID.")
                 use_current = input("Czy chcesz kontynuowac z obecna kolejka? (t/n): ").strip().lower()
                 
@@ -165,15 +185,27 @@ def main():
         "init-db", "full-scan", "scrape-url", "update-new", "resume", "stats", "daemon-ids", "fill-gaps", "id-range-scan", "spider", "harvest-cache"
     ], help="Komenda do wykonania (zostaw puste, by otworzyc menu)")
     parser.add_argument("--url", help="URL do pobrania dla trybu scrape-url")
+    parser.add_argument("--workers", "-w", type=int, default=5, help="Liczba watkow (domyslnie 5)")
+    parser.add_argument("--delay", "-d", type=str, default=None, help="Delay min,max w sekundach (np. '1.0,2.5')")
     
     args = parser.parse_args()
+    
+    # Ustawienie delay jesli podano
+    if args.delay:
+        parts = args.delay.split(',')
+        if len(parts) == 2:
+            config.MIN_DELAY = float(parts[0])
+            config.MAX_DELAY = float(parts[1])
+        elif len(parts) == 1:
+            config.MIN_DELAY = float(parts[0])
+            config.MAX_DELAY = float(parts[0])
     
     if not args.command:
         scraper = Scraper()
         run_interactive_menu(scraper)
         return
 
-    scraper = Scraper(mode=args.command)
+    scraper = Scraper(mode=args.command, max_workers=args.workers)
     try:
         if args.command == "init-db":
             init_db()

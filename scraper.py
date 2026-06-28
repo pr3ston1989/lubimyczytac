@@ -5,7 +5,7 @@ import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from curl_cffi import requests as cureq
 from loguru import logger
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn, MofNCompleteColumn
 
 import config
 from database import get_session
@@ -232,12 +232,21 @@ class Scraper:
             return
         with Progress(
             SpinnerColumn(),
-            TextColumn(f"[bold green]LubimyCzytac ([blue]{self.max_workers} Watkow[/blue]):[/bold green] {{task.description}}"),
+            TextColumn("[bold green]{task.description}[/bold green]"),
             BarColumn(),
+            MofNCompleteColumn(),
+            TextColumn("[cyan]|"),
             TaskProgressColumn(),
-            TextColumn("[cyan]Pozostalo: {task.remaining}"),
+            TextColumn("[cyan]|"),
+            TimeElapsedColumn(),
+            TextColumn("[cyan]→"),
+            TimeRemainingColumn(),
+            TextColumn("[cyan]| {task.speed:.1f} it/s" if "{task.speed}" != "None" else ""),
         ) as progress:
-            task = progress.add_task("Rozgrzewanie pajakow...", total=total_tasks)
+            task = progress.add_task(
+                f"[{self.max_workers}T] Delay {config.MIN_DELAY}-{config.MAX_DELAY}s",
+                total=total_tasks
+            )
             processed_count = 0
             while True:
                 batch = get_batch_queue(limit=self.max_workers)
@@ -250,7 +259,7 @@ class Scraper:
                         processed_count += 1
                         with get_session() as session:
                             new_pending = session.query(ScrapeQueue).filter_by(status='pending').count()
-                            progress.update(task, description=status_msg, completed=processed_count, total=processed_count + new_pending)
+                            progress.update(task, completed=processed_count, total=processed_count + new_pending)
 
     def seed_start_urls(self):
         starts = [
