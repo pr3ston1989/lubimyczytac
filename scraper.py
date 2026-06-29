@@ -30,6 +30,17 @@ class Scraper:
         self._delay_multiplier = 1.0  # mnoznik opoznienia (rosnie przy bledach)
         self._consecutive_errors = 0
         self._consecutive_ok = 0
+        # Thread-local storage dla sesji HTTP (reuzycie sesji per watek roboczy,
+        # zamiast tworzyc nowa przy kazdym zadaniu - zapobiega wyciekowi watkow DNS)
+        self._local = threading.local()
+
+    def _get_thread_session(self):
+        """Zwraca sesje HTTP przypisana do biezacego watku (tworzy raz na watek)."""
+        sess = getattr(self._local, "session", None)
+        if sess is None:
+            sess = cureq.Session(impersonate="chrome120")
+            self._local.session = sess
+        return sess
 
     def fetch(self, url: str) -> str:
         delay = random.uniform(config.MIN_DELAY, config.MAX_DELAY)
@@ -223,9 +234,9 @@ class Scraper:
         try:
             delay = self._get_delay()
             time.sleep(delay)
-            # Kazdy watek tworzy wlasna sesje HTTP (curl_cffi nie jest thread-safe)
-            with cureq.Session(impersonate="chrome120") as local_session:
-                res = local_session.get(url, timeout=15, allow_redirects=True)
+            # Reuzycie sesji per watek (thread-local) - zapobiega wyciekowi watkow DNS
+            local_session = self._get_thread_session()
+            res = local_session.get(url, timeout=15, allow_redirects=True)
             
             # Rate limiting detection
             if res.status_code in (429, 503):
@@ -302,18 +313,31 @@ class Scraper:
                 total=total_tasks
             )
             processed_count = 0
-            while True:
-                batch = get_batch_queue(limit=self.max_workers)
-                if not batch:
-                    break 
-                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # JEDNA trwala pula watkow na cale uruchomienie (zapobiega wyczerpaniu
+            # limitu watkow systemu przy tysiacach paczek na shared hostingu).
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                # Pobieramy wieksze paczki z bazy (mniej zapytan), ale utrzymujemy
+                # w locie maksymalnie ~2x liczba watkow zadan.
+                db_batch_size = max(self.max_workers * 10, 50)
+                while True:
+                    batch = get_batch_queue(limit=db_batch_size)
+                    if not batch:
+                        break
                     futures = {executor.submit(self.process_single_item, item): item for item in batch}
                     for future in as_completed(futures):
-                        status_msg = future.result()
+                        try:
+                            future.result()
+                        except Exception as e:
+                            logger.error(f"Watek zwrocil wyjatek: {e}")
                         processed_count += 1
-                        with get_session() as session:
-                            new_pending = session.query(ScrapeQueue).filter_by(status='pending').count()
+                        # Aktualizuj licznik 'total' rzadko (co 50 zadan), bo
+                        # zapytanie COUNT przy kazdym elemencie jest kosztowne.
+                        if processed_count % 50 == 0:
+                            with get_session() as session:
+                                new_pending = session.query(ScrapeQueue).filter_by(status='pending').count()
                             progress.update(task, completed=processed_count, total=processed_count + new_pending)
+                        else:
+                            progress.update(task, completed=processed_count)
 
     def run_update(self, id_lookahead: int = 2000):
         """
@@ -506,11 +530,11 @@ class Scraper:
         try:
             delay = random.uniform(config.MIN_DELAY, config.MAX_DELAY)
             time.sleep(delay)
-            with cureq.Session(impersonate="chrome120") as local_session:
-                response = local_session.get(url_to_check, timeout=15)
-                status_code = response.status_code
-                final_url = response.url
-                html_text = response.text
+            local_session = self._get_thread_session()
+            response = local_session.get(url_to_check, timeout=15)
+            status_code = response.status_code
+            final_url = response.url
+            html_text = response.text
             if status_code == 404:
                 with get_session() as db_session:
                     existing_item = db_session.query(ScrapeQueue).filter_by(url=url_to_check).first()
